@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.cortex/
+.snowflake/
+.venv/
+__pycache__/
+*.pyc
+local/
+results/
+logs/
