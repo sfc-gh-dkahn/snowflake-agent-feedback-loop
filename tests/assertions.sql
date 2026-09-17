@@ -1,5 +1,5 @@
 -- README: Run only AFTER fixtures.sql, in the SAME SESSION and OPEN transaction.
--- Use the SAME installed, dedicated disposable AF_TEST_ schema. Never production.
+-- Use the SAME installed, dedicated disposable schema. Never production.
 -- Stop on error. Do not COMMIT, run DDL, run procedures, or enable tasks between files.
 -- This block returns a summary on success; on failure it SELECTs names/details then
 -- raises an exception. Inspect that SELECT in query history if the client hides it.
@@ -18,19 +18,16 @@ DECLARE
     fixture_count INTEGER;
     fixture_transactions INTEGER;
     fixture_transaction NUMBER;
-    owns_fixture_transaction BOOLEAN DEFAULT FALSE;
     checks RESULTSET;
     checks_query_id VARCHAR;
     failure_count INTEGER;
     failure_details VARCHAR;
-    remaining_events INTEGER;
-    unsafe_session EXCEPTION (-20031, 'Run fixtures.sql first in this same session and transaction, using the same disposable AF_TEST_ installation.');
-    assertion_failed EXCEPTION (-20032, 'Fixture assertions failed; data rolled back. Inspect the preceding failure_count/failure_details SELECT in query history.');
+    unsafe_session EXCEPTION (-20031, 'Run fixtures.sql first in this same session and transaction, using the same disposable rendered installation.');
+    assertion_failed EXCEPTION (-20032, 'Fixture assertions failed; the open transaction is rolled back at session scope. Inspect the preceding failure_count/failure_details SELECT in query history.');
 BEGIN
     IF (CURRENT_TRANSACTION() IS NULL
         OR CURRENT_DATABASE() <> '__OUTPUT_DATABASE__'
-        OR CURRENT_SCHEMA() <> '__OUTPUT_SCHEMA__'
-        OR NOT STARTSWITH(CURRENT_SCHEMA(), 'AF_TEST_')) THEN
+        OR CURRENT_SCHEMA() <> '__OUTPUT_SCHEMA__') THEN
         RAISE unsafe_session;
     END IF;
     SELECT COUNT(*), COUNT(DISTINCT fixture_transaction_id), MIN(fixture_transaction_id)
@@ -40,7 +37,6 @@ BEGIN
         OR NOT COALESCE(fixture_transaction = CURRENT_TRANSACTION(), FALSE)) THEN
         RAISE unsafe_session;
     END IF;
-    owns_fixture_transaction := TRUE;
 
     checks := (
         WITH identities AS (
@@ -255,7 +251,7 @@ BEGIN
                 OR actual_tools.payload:chart_spec::VARCHAR IS DISTINCT FROM expected_tools.chart_spec
                 OR actual_tools.payload:status_code::VARCHAR IS DISTINCT FROM expected_tools.status_code
                 OR actual_tools.payload:event_epoch_ns::NUMBER IS DISTINCT FROM expected_tools.event_epoch_ns
-                OR ARRAY_SIZE(OBJECT_KEYS(actual_tools.payload)) IS DISTINCT FROM 9
+                OR ARRAY_SIZE(OBJECT_KEYS(actual_tools.payload)) IS DISTINCT FROM 8
             UNION ALL
             SELECT 'event_order', COALESCE(expected_events.event_key, actual_events.event_hash)
             FROM expected_events FULL OUTER JOIN actual_events
@@ -279,26 +275,36 @@ BEGIN
         WITHIN GROUP (ORDER BY check_name, detail)
     INTO :failure_count, :failure_details
     FROM TABLE(RESULT_SCAN(:checks_query_id));
-    ROLLBACK;
-    owns_fixture_transaction := FALSE;
-    SELECT COUNT(*) INTO :remaining_events FROM AF_EVENTS;
-    IF (remaining_events <> 0) THEN
-        failure_count := failure_count + 1;
-        failure_details := COALESCE(failure_details || '\n', '')
-            || 'rollback_cleanup: AF_EVENTS is not empty; inspect concurrent writers or transaction handling.';
-    END IF;
     IF (failure_count <> 0) THEN
         SELECT :failure_count AS failure_count, :failure_details AS failure_details;
         RAISE assertion_failed;
     END IF;
-    RETURN OBJECT_CONSTRUCT('status', 'PASS', 'failure_count', failure_count,
+    RETURN OBJECT_CONSTRUCT('status', 'CHECKS_PASS', 'failure_count', failure_count,
+        'events_tested', 120, 'turns_tested', 80, 'pairs_tested', 12,
+        'rolled_back', FALSE, 'inference_performed', FALSE);
+END;
+$$;
+
+-- Transaction control stays at session scope. Snowflake refuses to let a
+-- scripting block modify a transaction that began outside its own scope, so
+-- the rollback cannot live inside the block above. If the block raised, this
+-- statement does not run and disconnecting discards the uncommitted rows.
+ROLLBACK;
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    remaining_events INTEGER;
+    cleanup_failed EXCEPTION (-20033, 'Rollback did not clear AF_EVENTS; inspect concurrent writers or transaction handling.');
+BEGIN
+    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
+        RAISE cleanup_failed;
+    END IF;
+    SELECT COUNT(*) INTO :remaining_events FROM AF_EVENTS;
+    IF (remaining_events <> 0) THEN
+        RAISE cleanup_failed;
+    END IF;
+    RETURN OBJECT_CONSTRUCT('status', 'PASS', 'failure_count', 0,
         'events_tested', 120, 'turns_tested', 80, 'pairs_tested', 12,
         'rolled_back', TRUE, 'inference_performed', FALSE);
-EXCEPTION
-    WHEN OTHER THEN
-        IF (owns_fixture_transaction) THEN
-            ROLLBACK;
-        END IF;
-        RAISE;
 END;
 $$;

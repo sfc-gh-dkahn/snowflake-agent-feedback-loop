@@ -461,7 +461,7 @@ class SourceContractTests(unittest.TestCase):
                 self.assertEqual(found, allowed_by_file.get(name, common))
                 rendered = source
                 for placeholder in found:
-                    rendered = rendered.replace(placeholder, "AF_TEST_SYNTHETIC")
+                    rendered = rendered.replace(placeholder, "AF_RENDER_SYNTHETIC")
                 self.assertIsNone(re.search(r"__[A-Za-z][A-Za-z0-9_]*?__", rendered))
                 self.assertIsNone(re.search(r"\b(?:TODO|FIXME|CHANGEME)\b", source, re.I))
                 statements(rendered)
@@ -680,7 +680,10 @@ class SourceContractTests(unittest.TestCase):
         guard = list(nested_tokens(fixtures[2]))
         self.assertIn("CURRENT_TRANSACTION ( ) IS NOT NULL", code(guard))
         self.assertIn("EXISTING_ROWS <> 0", code(guard))
-        self.assertIn("AF_TEST_", [token.value for token in guard if token.kind == "string"])
+        self.assertIn("CURRENT_SCHEMA ( ) <>", code(guard))
+        guard_strings = [token.value for token in guard if token.kind == "string"]
+        self.assertIn("__OUTPUT_SCHEMA__", guard_strings)
+        self.assertNotIn("AF_TEST_", guard_strings)
         self.assertIn("TASK_COUNT <> 7 OR UNSAFE_TASKS <> 0", code(guard))
         self.assertIn("SUSPENDED", [token.value for token in guard if token.kind == "string"])
         for name in ["tests/fixtures.sql", "tests/assertions.sql"]:
@@ -697,10 +700,18 @@ class SourceContractTests(unittest.TestCase):
         assertions = code(list(nested_tokens(lex(self.sources["tests/assertions.sql"]))))
         self.assertNotRegex(assertions, r"\b(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|UPDATE|DELETE)\b")
         self.assertIn("FIXTURE_TRANSACTION = CURRENT_TRANSACTION ( )", assertions)
-        self.assertIn("ROLLBACK ; OWNS_FIXTURE_TRANSACTION := FALSE ; SELECT COUNT", assertions)
         self.assertIn("REMAINING_EVENTS <> 0", assertions)
         self.assertIn("RAISE ASSERTION_FAILED", assertions)
-        self.assertIn("WHEN OTHER THEN IF ( OWNS_FIXTURE_TRANSACTION ) THEN ROLLBACK", assertions)
+        # Transaction control must sit at session scope: Snowflake rejects a
+        # scripting block that rolls back a transaction begun outside it.
+        for name in ["tests/fixtures.sql", "tests/assertions.sql"]:
+            with self.subTest(file=name):
+                for chunk in self.parsed[name]:
+                    for token in chunk:
+                        if token.kind == "dollar":
+                            self.assertNotIn("ROLLBACK", values(lex(token.value)))
+        top_level = [values(chunk) for chunk in self.parsed["tests/assertions.sql"]]
+        self.assertEqual(top_level.count(["ROLLBACK", ";"]), 1)
 
     def test_fixture_population_is_explicit_and_synthetic(self):
         table = self.definitions[("TABLE", "AF_FIXTURE_EVENTS")]

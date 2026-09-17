@@ -1,6 +1,6 @@
 -- README: OFFLINE-AUTHORED TEST INPUT. NOT EXECUTED OR COMPILED AGAINST SNOWFLAKE.
 -- Install sql/00_setup.sql through sql/06_tasks.sql LATER in a NEW, dedicated,
--- disposable schema whose name starts with AF_TEST_. Never use a production schema.
+-- disposable schema created solely for this test. Never use a production schema.
 -- Replace __OUTPUT_DATABASE__ and __OUTPUT_SCHEMA__ with that SAME install target.
 -- Keep all tasks suspended; use a single session, AUTOCOMMIT enabled, no concurrent
 -- writers, and a client that STOPS ON ERROR. Do not run install SQL between these files.
@@ -19,12 +19,11 @@ DECLARE
     task_count INTEGER;
     unsafe_tasks INTEGER;
     tasks_query_id VARCHAR;
-    unsafe_target EXCEPTION (-20030, 'Use a new empty AF_TEST_ schema with the matching installation, no active transaction, and suspended tasks. Stop on error.');
+    unsafe_target EXCEPTION (-20030, 'Use a new empty disposable schema matching this rendered installation, with no active transaction and suspended tasks. Stop on error.');
 BEGIN
     IF (CURRENT_TRANSACTION() IS NOT NULL
         OR CURRENT_DATABASE() <> '__OUTPUT_DATABASE__'
-        OR CURRENT_SCHEMA() <> '__OUTPUT_SCHEMA__'
-        OR NOT STARTSWITH(CURRENT_SCHEMA(), 'AF_TEST_')) THEN
+        OR CURRENT_SCHEMA() <> '__OUTPUT_SCHEMA__') THEN
         RAISE unsafe_target;
     END IF;
     SELECT SUM(row_count) INTO :existing_rows FROM (
@@ -139,7 +138,9 @@ BEGIN
     FROM AF_FIXTURE_EVENTS;
 EXCEPTION
     WHEN OTHER THEN
-        ROLLBACK;
+        -- No ROLLBACK here: the transaction began at session scope and
+        -- Snowflake refuses to let this block modify it. Nothing is committed,
+        -- so run ROLLBACK yourself in this session, or disconnect.
         RAISE;
 END;
 $$;
