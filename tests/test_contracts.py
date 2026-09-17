@@ -416,7 +416,14 @@ class LexerTests(unittest.TestCase):
 class SourceContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.paths = sorted(ROOT.rglob("*.sql"))
+        # Only the repository's own SQL directories. A recursive sweep would also
+        # read rendered copies under the gitignored local/, results/, and logs/
+        # directories, and report every object in them as a duplicate definition.
+        cls.paths = sorted(
+            path
+            for directory in ("sql", "tests", "optional")
+            for path in (ROOT / directory).glob("*.sql")
+        )
         cls.sources = {path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8") for path in cls.paths}
         cls.parsed = {name: statements(source) for name, source in cls.sources.items()}
         cls.definitions = {}

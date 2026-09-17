@@ -36,6 +36,29 @@ SHOW CORTEX BASE MODELS;
 
 Inspect the model listing and confirm that the chosen model supports the required structured response and is permitted by the account's model controls, region settings, and role grants. `AF_PREFLIGHT` does not check model availability or call AI. These are instructions for later approved checks, not claims of live testing.
 
+### Rendering the Substitutions
+
+Editing seven files by hand invites a missed placeholder. `tools/render_install.py` does the substitution for you and refuses bad input. It reads repository text and writes rendered copies; it runs no SQL, calls no AI, sends no email, creates no task or schedule, starts no subprocess, and needs no packages beyond the standard library. Hand editing remains a supported, auditable fallback.
+
+```bash
+python3 -B tools/render_install.py render \
+  --output-database __OUTPUT_DATABASE__ --output-schema __OUTPUT_SCHEMA__ \
+  --agent __AGENT_DATABASE__.__AGENT_SCHEMA__.__AGENT_NAME__ \
+  --warehouse __WAREHOUSE__ --role __ROLE__ \
+  --judge-model your-judge-model \
+  --docs-service DOCS_DATABASE.DOCS_SCHEMA.DOCS_SERVICE
+```
+
+It validates identifiers against the same rules `AF_PREFLIGHT` enforces, checks model-name syntax, writes the seven install files followed by the two test files in required order, and fails if any placeholder survives. Substitute your own approved values above; the harness rejects the bracketed placeholder text itself, because a value containing `__` would read as an unresolved placeholder. Output goes to `local/render` by default; the harness refuses any directory `.gitignore` does not already exclude, so a configured copy cannot reach a public commit. It prints the exact rendered paths and the next commands, including the separate `AF_CONFIG.docs_service` update, and reports what it has not done.
+
+Creating the output schema is a separate action that needs `--approve-ddl`, and it writes the one `CREATE SCHEMA` statement for you to review and run yourself:
+
+```bash
+python3 -B tools/render_install.py create-schema --approve-ddl [same arguments]
+```
+
+Passing validation is not proof of anything live. It does not prove the SQL compiles, that your role holds the required grants, that the model is permitted or returns structured output, or that the documentation service is reachable. `optional/email.sql` is never rendered; email stays a separate approval and a manual install.
+
 ## Install, Then Preflight
 
 Run **all seven** numbered SQL files in order, `00` through `06`, only after reviewing the substitutions and approving DDL. Installation defines objects and inserts configuration/reference rows; it does **not** invoke the runtime procedures, execute tasks, call AI, send email, or enable a schedule. It is not a rerunnable migration: several objects use plain `CREATE`.
@@ -88,7 +111,9 @@ To deliberately retry persisted inference with otherwise unchanged inputs, chang
 | `sql/05_recommend.sql` | Retrieve docs, validate proposals, map results to runs | Required install 6 |
 | `sql/06_tasks.sql` | Run guards, manual runner, review queue, task graph and finish accounting | Required install 7 |
 | `optional/email.sql` | Separately installed summary delivery and delivery ledger | Optional; no integration creation |
+| `tools/render_install.py` | Render placeholders privately; write schema DDL for review; runs no SQL | Offline helper |
 | `tests/test_contracts.py` | Static contract checks without Snowflake or AI | 27 offline tests passed |
+| `tests/test_harness.py` | Validation, rendering, private-output and no-execution checks for the harness | 24 offline tests passed |
 | `tests/fixtures.sql` | Isolated synthetic inputs, never runtime agent seeds | Included; Snowflake execution pending |
 | `tests/assertions.sql` | Fixture/output assertions in an approved disposable test schema | Included; Snowflake execution pending |
 | `.gitignore` | Exclude common local configuration, environments, logs, and results | Not a secret scanner |
@@ -98,7 +123,7 @@ Static checks cannot prove Snowflake compilation, privileges, event shape, struc
 Run the offline checks from the repository root:
 
 ```bash
-python3 -B -m unittest discover -s tests -p test_contracts.py -v
+python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 ## CoCo Starter
