@@ -130,7 +130,7 @@ BEGIN
             SELECT column1::VARCHAR AS kind, PARSE_JSON(column2) AS payload
             FROM VALUES
                 ('diagnosis', '{"assessment":"poor","issue_type":"agent_behavior","severity":"moderate","surface":"instructions.response","observation":"Synthetic format mismatch.","evidence_quote":"Synthetic answer.","suspected_cause":"unknown","preserve_behavior":"Preserve synthetic scope.","requires_review":true}'),
-                ('recommendation', '{"recommendation_warranted":true,"headline":"Review synthetic formatting.","reasoning":"Synthetic mock only.","suggested_change":"Investigate formatting.","change_mode":"investigate","displaced_text":"","preserve_behavior":"Preserve synthetic scope.","would_regress_good_behavior":false,"confidence":"low","citations":[]}')
+                ('recommendation', '{"recommendation_warranted":true,"headline":"Review synthetic formatting.","reasoning":"Synthetic mock only.","suggested_change":"Investigate formatting.","change_mode":"investigate","displaced_text":"","preserve_behavior":"Preserve synthetic scope.","would_regress_good_behavior":false,"confidence":"low","data_gap_investigation":"","unknown_data_response_guidance":"","citations":[]}')
         ), contract_cases AS (
             SELECT kind, 'valid_base' AS case_name, payload, TRUE AS expected_valid FROM verdicts
             UNION ALL
@@ -184,6 +184,23 @@ BEGIN
             UNION ALL
             SELECT kind, 'not_warranted', OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(payload::OBJECT,
                 'recommendation_warranted', FALSE, TRUE), 'change_mode', 'none', TRUE), 'suggested_change', '', TRUE), TRUE
+            FROM verdicts WHERE kind = 'recommendation'
+            UNION ALL
+            -- Two-part reported-gap advice: both fields are typed strings the validator
+            -- must accept when populated. Whether each is required is decided per group
+            -- inside AF_RECOMMEND, which knows the target surface; the contract here is
+            -- only that populated advice stays valid and a non-string never does.
+            SELECT kind, 'gap_two_part_populated', OBJECT_INSERT(OBJECT_INSERT(payload::OBJECT,
+                'data_gap_investigation', 'Check whether the reported scope is absent.', TRUE),
+                'unknown_data_response_guidance', 'Say the coverage is unknown and route to the approved contact path.', TRUE), TRUE
+            FROM verdicts WHERE kind = 'recommendation'
+            UNION ALL
+            SELECT kind, 'gap_investigation_not_text', OBJECT_INSERT(payload::OBJECT,
+                'data_gap_investigation', TO_VARIANT(ARRAY_CONSTRUCT('investigate')), TRUE), FALSE
+            FROM verdicts WHERE kind = 'recommendation'
+            UNION ALL
+            SELECT kind, 'gap_guidance_not_text', OBJECT_INSERT(payload::OBJECT,
+                'unknown_data_response_guidance', TO_VARIANT(42), TRUE), FALSE
             FROM verdicts WHERE kind = 'recommendation'
         ), contract_results AS (
             SELECT kind, case_name, expected_valid, AF_DIAGNOSIS_VALID(payload) AS actual_valid

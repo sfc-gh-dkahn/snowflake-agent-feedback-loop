@@ -18,7 +18,7 @@ CREATE TABLE AF_CONFIG (
 
 INSERT INTO AF_CONFIG VALUES (
     1, '__AGENT_DATABASE__', '__AGENT_SCHEMA__', '__AGENT_NAME__',
-    '__JUDGE_MODEL__', NULL, 14, 20, 5, 2, 168, '1'
+    '__JUDGE_MODEL__', NULL, 14, 20, 5, 2, 168, '2'
 );
 
 CREATE TABLE AF_RUNS (
@@ -167,6 +167,8 @@ $$
         AND IS_VARCHAR(result:preserve_behavior)
         AND result:change_mode::VARCHAR IN ('append', 'replace', 'investigate', 'none')
         AND IS_VARCHAR(result:displaced_text)
+        AND IS_VARCHAR(result:data_gap_investigation)
+        AND IS_VARCHAR(result:unknown_data_response_guidance)
         AND IS_BOOLEAN(result:would_regress_good_behavior)
         AND result:confidence::VARCHAR IN ('low', 'medium', 'high')
         AND IS_ARRAY(result:citations)

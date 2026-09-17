@@ -25,7 +25,8 @@ DIAGNOSIS_FIELDS = (
 ).split()
 RECOMMENDATION_FIELDS = (
     "recommendation_warranted headline reasoning suggested_change change_mode "
-    "displaced_text preserve_behavior would_regress_good_behavior confidence citations"
+    "displaced_text preserve_behavior would_regress_good_behavior confidence "
+    "data_gap_investigation unknown_data_response_guidance citations"
 ).split()
 TABLE_FIELDS = {
     "AF_CONFIG": "config_id " + IDENTITY + " judge_model docs_service lookback_days max_diagnoses max_recommendations min_occurrences docs_cache_hours prompt_revision",
@@ -45,7 +46,7 @@ VIEW_FIELDS = {
     "AF_TURNS": TURN_FIELDS,
     "AF_FEEDBACK_PAIRS": TURN_FIELDS + ["response_trace_id", "response_turn_hash"],
     "AF_FINDINGS": ("run_id diagnosis_id " + IDENTITY + " thread_id response_trace_id feedback_trace_id feedback_ts judged_at validation_status assessment issue_type surface severity observation suspected_cause preserve_behavior error_message review_status").split(),
-    "AF_REVIEW_QUEUE": ("run_id recommendation_id " + IDENTITY + " surface created_at summary reasoning suggested_change change_mode displaced_text preserve_behavior confidence citations review_status docs_status run_status completed_at").split(),
+    "AF_REVIEW_QUEUE": ("run_id recommendation_id " + IDENTITY + " surface created_at summary reasoning suggested_change change_mode displaced_text preserve_behavior confidence citations data_gap_investigation unknown_data_response_guidance advice_state failure_detail ai_response_debug qualified_by review_status docs_status run_status completed_at").split(),
 }
 TASK_PARENTS = {
     "AF_START": None,
@@ -658,6 +659,159 @@ class SourceContractTests(unittest.TestCase):
         citations = recommendation_schema["properties"]["citations"]["items"]
         self.assertEqual(set(citations["properties"]), {"url", "quote", "supports"})
         self.assertCountEqual(citations["required"], ["url", "quote", "supports"])
+
+    def test_recommendation_gate_admits_same_thread_recurrence(self):
+        """A multi-turn episode in one thread must be able to qualify on its own.
+
+        Grouping only by (agent, surface) and counting only 'poor' traces means a
+        single conversation can never reach a threshold of two, so a reported gap
+        raised over several turns is dropped. Recurrence is therefore also counted
+        inside one thread, anchored by at least one 'poor' turn.
+        """
+        source = self.sources["sql/05_recommend.sql"]
+        body = list(nested_tokens(self.definitions[("PROCEDURE", "AF_RECOMMEND")]))
+        words = values(body)
+        for name in ["THREAD_SIGNATURES", "RECURRENCE", "CORROBORATING"]:
+            with self.subTest(cte=name):
+                self.assertEqual(len([index for index in range(len(words))
+                                      if words[index:index + 3] == [name, "AS", "("]]), 1)
+        signatures, _ = grouped(body, next(index for index in range(len(words))
+                                           if words[index:index + 3] == ["THREAD_SIGNATURES", "AS", "("]) + 2)
+        # Recurrence is per thread, per surface, per issue_type -- never across threads.
+        for required in ["THREAD_ID", "SURFACE", "ISSUE_TYPE"]:
+            self.assertIn(required, values(signatures))
+        self.assertIn("COUNT ( DISTINCT RESPONSE_TRACE_ID ) AS THREAD_TRACE_COUNT", code(signatures))
+        self.assertIn("AS THREAD_HAS_POOR", code(signatures))
+        self.assertRegex(source, r"WHERE thread_has_poor = 1 AND thread_trace_count > 1")
+        having = re.search(r"HAVING (COUNT\(DISTINCT response_trace_id\)[^)]*?)\n *\), snapshots", source, re.S)
+        self.assertIsNotNone(having, "poor_groups HAVING clause not found")
+        self.assertEqual(
+            re.sub(r"\s+", " ", having.group(1)).strip(),
+            "COUNT(DISTINCT response_trace_id) >= :min_occurrences OR has_severe = 1 "
+            "OR max_thread_recurrence >= :min_occurrences",
+        )
+        # The threshold itself stays configurable; the gate must not lower it.
+        self.assertNotRegex(source, r"min_occurrences\s*(?:=|>=)\s*1\b")
+        self.assertIn("'qualified_by'", source)
+        for reason in ["distinct_poor_traces", "severe_single_trace", "same_thread_recurrence"]:
+            self.assertIn(reason, [token.value for token in body if token.kind == "string"])
+
+    def test_recommendation_prompt_and_output_are_bounded(self):
+        """Unbounded evidence in, default cap out: the model returns SQL NULL.
+
+        AI_COMPLETE defaults max_tokens to 4096, so a long structured answer is
+        truncated and surfaces as NULL rather than an error. The declared cap and
+        the literal in the call must agree, and evidence must be bounded before it
+        reaches the prompt.
+        """
+        source = self.sources["sql/05_recommend.sql"]
+        declared = dict(re.findall(r"\n    ([a-z_]+) INTEGER DEFAULT (\d+);", source))
+        for name, ceiling in [("sample_limit", 10), ("counterevidence_limit", 10),
+                              ("corroboration_limit", 10), ("evidence_prior_turns", 6),
+                              ("prior_turn_chars", 4000), ("feedback_turn_chars", 4000)]:
+            with self.subTest(bound=name):
+                self.assertIn(name, declared)
+                self.assertTrue(0 < int(declared[name]) <= ceiling)
+        self.assertIn("max_output_tokens", declared)
+        self.assertGreater(int(declared["max_output_tokens"]), 4096)
+        recommend = list(nested_tokens(self.definitions[("PROCEDURE", "AF_RECOMMEND")]))
+        call = next(arguments for function_name, arguments in ai_calls(recommend)
+                    if function_name == "AI_COMPLETE")
+        parameters = next(part for part in comma_parts(call)
+                          if values(part)[:2] == ["MODEL_PARAMETERS", "=>"])
+        literal = object_literal(parameters[2:])
+        self.assertEqual(literal["temperature"], 0)
+        # Drift here is silent and expensive: the declared bound is what gets recorded.
+        self.assertEqual(literal["max_tokens"], int(declared["max_output_tokens"]))
+        for bound in ["prior_turn_chars", "feedback_turn_chars"]:
+            self.assertRegex(source, rf"LEFT\([^\n]*?, :{bound}\)")
+        for bound in ["sample_limit", "counterevidence_limit", "corroboration_limit",
+                      "evidence_prior_turns"]:
+            with self.subTest(bound=bound):
+                self.assertRegex(source, rf"<= :{bound}\b")
+        self.assertNotRegex(source, r"_rank <= 10\b")
+
+    def test_recommendation_failures_stay_debuggable(self):
+        """An invalid or empty answer must leave something a reviewer can read."""
+        source = self.sources["sql/05_recommend.sql"]
+        recommend = list(nested_tokens(self.definitions[("PROCEDURE", "AF_RECOMMEND")]))
+        call = next(arguments for function_name, arguments in ai_calls(recommend)
+                    if function_name == "AI_COMPLETE")
+        details = next(part for part in comma_parts(call)
+                       if values(part)[:2] == ["RETURN_ERROR_DETAILS", "=>"])
+        self.assertEqual(values(details)[2], "TRUE")
+        self.assertIn("'ai_response_debug'", source)
+        for field in ["'prompt_chars'", "'response_chars'", "'response_text_head'", "'model_error'"]:
+            self.assertIn(field, source)
+        self.assertRegex(source, r"GET\(ai_envelope, 'value'\)")
+        self.assertRegex(source, r"GET\(ai_envelope, 'error'\)::VARCHAR")
+        # The queue must separate "the call failed" from "no change was recommended".
+        queue = self.definitions[("VIEW", "AF_REVIEW_QUEUE")]
+        queue_strings = [token.value for token in nested_tokens(queue) if token.kind == "string"]
+        for state in ["call_failed_no_advice", "advice_ready", "no_change_recommended",
+                      "advice_needs_attention", "no_advice_yet"]:
+            self.assertIn(state, queue_strings)
+        self.assertIn("failure_detail", projection(queue))
+        self.assertIn("ai_response_debug", projection(queue))
+
+    def test_reported_gap_advice_requires_two_human_actions(self):
+        """Reported-gap review advice covers investigation and answer guidance.
+
+        Both are human actions and neither implies the gap is real, so each gets
+        its own required field and the two may not collapse into one sentence.
+        """
+        source = self.sources["sql/05_recommend.sql"]
+        for field in ["data_gap_investigation", "unknown_data_response_guidance"]:
+            with self.subTest(field=field):
+                self.assertIn(field, RECOMMENDATION_FIELDS)
+                self.assertRegex(source, rf"output:{field}::VARCHAR")
+        gate = r"surface = 'data' OR candidate\.REPORTED_GAP = 1"
+        self.assertGreaterEqual(len(re.findall(gate, source)), 4)
+        self.assertRegex(source, r"TRIM\(output:data_gap_investigation::VARCHAR\)\s*\n?\s*"
+                                 r"= TRIM\(output:unknown_data_response_guidance::VARCHAR\)")
+        # No invented owner: an at sign is the cheap, reliable tell.
+        self.assertRegex(source, r"CONTAINS\(COALESCE\(output:data_gap_investigation")
+        self.assertIn("'@'", source)
+        self.assertRegex(source, r"NOT \(surface = 'data' OR candidate\.REPORTED_GAP = 1\)\s*\n\s*"
+                                 r"AND \(LENGTH\(TRIM\(output:data_gap_investigation")
+        rules = next(token.value for token in nested_tokens(
+            self.definitions[("PROCEDURE", "AF_RECOMMEND")])
+            if token.kind == "string" and "propose changes for human review" in token.value)
+        prompt = " ".join(token.value for token in nested_tokens(
+            self.definitions[("PROCEDURE", "AF_RECOMMEND")]) if token.kind == "string")
+        self.assertIn("two separate human actions", prompt)
+        self.assertIn("operator-approved contact path", prompt)
+        self.assertIn("never include an at sign", prompt)
+        self.assertRegex(prompt, r"[Nn]ever state or imply the gap is confirmed")
+        self.assertTrue(rules)
+
+    def test_sql_carries_no_domain_or_deployment_specific_literals(self):
+        """The kit ships generic. A worked example must not leak into the template."""
+        forbidden = r"\b(?:mlb|braves|baseball|roster|inning|ballpark|athlete|franchise|" \
+                    r"snowhouse|demo_acc|kahn)\b"
+        for name, source in self.sources.items():
+            with self.subTest(file=name):
+                self.assertIsNone(re.search(forbidden, source, re.I))
+                # No captured thread, run, or account identifier from any proof run.
+                self.assertIsNone(re.search(r"'\d{9,}'", source))
+
+    def test_having_aliases_do_not_shadow_upstream_columns(self):
+        """A HAVING alias that also names an input column resolves to the column.
+
+        Snowflake then rejects the query with 'not a valid group by expression'.
+        The recurrence gate hit this, so the aggregate's output name and the
+        upstream column name are deliberately different.
+        """
+        source = self.sources["sql/05_recommend.sql"]
+        recurrence = re.search(r"\), recurrence AS \((.*?)\n        \), ", source, re.S)
+        self.assertIsNotNone(recurrence, "recurrence CTE not found")
+        produced = set(re.findall(r"AS ([a-z_]+)", recurrence.group(1)))
+        self.assertTrue(produced)
+        having = re.search(r"HAVING (COUNT\(DISTINCT response_trace_id\).*?)\n *\), snapshots",
+                           source, re.S)
+        self.assertIsNotNone(having, "poor_groups HAVING clause not found")
+        bare = set(re.findall(r"(?<![.:])\b([a-z_]{4,})\b(?!\s*\()", having.group(1)))
+        self.assertEqual(produced & (bare - {"min_occurrences"}), set())
 
     def test_fixture_insert_covers_every_event_field(self):
         flat = list(nested_tokens(lex(self.sources["tests/fixtures.sql"])))
