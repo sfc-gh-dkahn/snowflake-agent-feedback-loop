@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""Render the install SQL with your own identifiers, into a private directory.
+"""Render private install SQL with your identifiers.
 
 Run: python3 -B tools/render_install.py render --help
 
-This harness only reads repository text and writes rendered copies. It never
-connects to Snowflake, never runs DDL, never calls AI, never sends email, and
-never creates a task or schedule. It has no third-party dependencies and starts
-no subprocess. Installation, preflight, inference, email, and scheduling stay
-separate approvals that you carry out yourself with the printed commands.
+This tool reads repository files and writes configured copies under an ignored
+directory. It runs no SQL and needs only the Python standard library.
 
 Two actions:
 
   render         Substitute placeholders and write the ordered install files.
   create-schema  Write the one CREATE SCHEMA statement. Needs --approve-ddl.
 
-Rendered output lands under `local/`, which `.gitignore` already excludes, so a
-configured copy does not reach a public commit. Nothing here proves that the SQL
-compiles, that your role has the required grants, or that the chosen model is
-permitted; those remain later approved checks.
+Rendered output defaults to `local/render`, which Git ignores.
 """
 
 import argparse
@@ -27,6 +21,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# The renderer and contract tests share one statement splitter.
+sys.path.insert(0, str(ROOT / "tools"))
+
+from sql_lexer import definition, statement_source, statements  # noqa: E402
 
 # Install files, in the order they must run. Order is part of the contract:
 # several objects use plain CREATE and depend on earlier files.
@@ -48,6 +47,10 @@ TEST_FILES = (
 
 # `optional/email.sql` is deliberately absent. Email is a separate approval and
 # a separate manual install; this harness does not render it.
+
+# Generated files for commands that must stay in one `snow sql` statement/session.
+CLI_TASKS = "sql/06_tasks.cli.sql"
+CLI_TEST_PAIR = "tests/fixture_pair.cli.sql"
 
 # Directory names `.gitignore` already excludes. Rendered output must stay in one.
 PRIVATE_ROOTS = ("local", "results", "logs")
@@ -163,6 +166,74 @@ def render_text(source, values):
     return rendered
 
 
+def task_bodies(source):
+    """Return {task name: exact source text} for every CREATE TASK in source."""
+    found = {}
+    for chunk in statements(source):
+        info = definition(chunk)
+        if info and info[0] == "TASK":
+            found[info[1]] = statement_source(source, chunk).strip()
+    return found
+
+
+def cli_safe_tasks(source):
+    """Wrap task DDL so `snow sql` keeps each scripting body whole."""
+    pieces = []
+    wrapped = 0
+    for chunk in statements(source):
+        raw = statement_source(source, chunk).rstrip()
+        info = definition(chunk)
+        if info and info[0] == "TASK":
+            if "$$" in raw:
+                raise HarnessError(
+                    "cannot derive a CLI-safe copy: task %s already contains $$, "
+                    "which would terminate the EXECUTE IMMEDIATE wrapper" % info[1]
+                )
+            pieces.append("EXECUTE IMMEDIATE $$\n%s\n$$;" % raw)
+            wrapped += 1
+        else:
+            pieces.append(raw)
+    if not wrapped:
+        raise HarnessError(
+            "expected at least one CREATE TASK in %s; found none, so the CLI-safe "
+            "copy would be pointless" % CLI_TASKS
+        )
+
+    header = (
+        "-- Derived by tools/render_install.py. Do not edit; re-render instead.\n"
+        "-- Use this file with `snow sql`. Each task uses EXECUTE IMMEDIATE so\n"
+        "-- the CLI keeps its Snowflake Scripting body in one statement.\n\n"
+    )
+    text = header + "\n\n".join(pieces) + "\n"
+
+    # Refuse the output if any task changed.
+    before = task_bodies(source)
+    after = {}
+    for piece in text.split("EXECUTE IMMEDIATE $$\n")[1:]:
+        after.update(task_bodies(piece.split("\n$$;")[0].strip()))
+    if before != after:
+        missing = sorted(set(before) ^ set(after))
+        changed = sorted(name for name in set(before) & set(after) if before[name] != after[name])
+        raise HarnessError(
+            "CLI-safe derivation altered task text; refusing to write it. "
+            "missing/extra=%s changed=%s" % (missing, changed)
+        )
+    return text, wrapped
+
+
+def test_pair(fixtures, assertions):
+    """Keep fixtures and assertions in one `snow sql` session."""
+    return (
+        "-- Derived by tools/render_install.py. Do not edit; re-render instead.\n"
+        "-- Run this file once. It keeps the test transaction and temporary table\n"
+        "-- in one session, then rolls back the fixture rows.\n\n"
+        + fixtures.rstrip()
+        + "\n\n"
+        + assertions.rstrip()
+        + "\n"
+    )
+
+
 def private_directory(raw, root=None):
     """Resolve the output directory and refuse anything git would track."""
     root = Path(root or ROOT)
@@ -237,7 +308,7 @@ def connection_flag(connection):
     return " -c %s" % connection if connection else ""
 
 
-def plan_lines(settings, out, rendered, connection):
+def plan_lines(settings, out, rendered, task_count, connection):
     """The exact paths and the exact next commands, in order."""
     flag = connection_flag(connection)
     qualified = "%s.%s" % (settings["output_database"], settings["output_schema"])
@@ -254,15 +325,15 @@ def plan_lines(settings, out, rendered, connection):
         "Docs search service  : %s" % settings["docs_service"],
         "Output directory     : %s" % out,
         "",
-        "Files, in the order they must run:",
+        "Rendered files:",
     ]
     for index, path in enumerate(rendered, 1):
         lines.append("  %2d. %s" % (index, path))
     lines += [
         "",
-        "Next commands. Run them yourself, one approval at a time.",
+        "Next commands",
         "",
-        "1. Create the empty output schema (separate DDL approval):",
+        "1. If needed, write the empty-schema DDL for review:",
         "     python3 -B tools/render_install.py create-schema --approve-ddl \\",
         "       --output-database %s --output-schema %s \\"
         % (settings["output_database"], settings["output_schema"]),
@@ -276,37 +347,39 @@ def plan_lines(settings, out, rendered, connection):
         ),
         "       --judge-model %s --docs-service %s"
         % (settings["judge_model"], settings["docs_service"]),
-        "   then run the printed file with snow sql.",
+        "   Then review and run the printed file with snow sql.",
         "",
-        "2. Install all seven files in order (DDL approval):",
+        "2. Install the first six files in order:",
     ]
-    for path in rendered[: len(INSTALL_FILES)]:
-        lines.append("     snow sql%s --role %s -f %s" % (flag, settings["role"], path))
+    for name in INSTALL_FILES[:-1]:
+        lines.append("     snow sql%s --role %s -f %s" % (
+            flag, settings["role"], rendered[name]
+        ))
     lines += [
         "",
-        "3. Run the deterministic test pair in one session, then confirm cleanup:",
+        "3. Install the %d suspended tasks with the CLI-safe file:" % task_count,
+        "     snow sql%s --role %s -f %s" % (
+            flag, settings["role"], rendered[CLI_TASKS]
+        ),
+        "",
+        "4. Run the tests in one CLI session:",
+        "     snow sql%s --role %s -f %s" % (
+            flag, settings["role"], rendered[CLI_TEST_PAIR]
+        ),
     ]
-    for path in rendered[len(INSTALL_FILES) :]:
-        lines.append("     snow sql%s --role %s -f %s" % (flag, settings["role"], path))
     lines += [
         "",
-        "4. Preflight. Reads configuration and bounded telemetry; calls no AI:",
+        "5. Run the no-AI preflight:",
         "     snow sql%s --role %s -q \"CALL %s.AF_PREFLIGHT();\""
         % (flag, settings["role"], qualified),
-        "   Require ok = true and inference_performed = false before going on.",
+        "   Require ok = true and inference_performed = false.",
         "",
-        "5. Point recommendations at the documentation service. Separate step,",
-        "   because sql/00_setup.sql inserts docs_service as NULL on purpose:",
+        "6. Set the documentation service:",
         "     snow sql%s --role %s -q \"UPDATE %s.AF_CONFIG SET docs_service = "
         "'%s' WHERE config_id = 1;\""
         % (flag, settings["role"], qualified, settings["docs_service"]),
         "",
-        "Still separate, still not done here:",
-        "  - AI inference. Approve the evidence window and token cost first, and",
-        "    bound the run with explicit window_start, window_end, thread_filter.",
-        "  - Email. Install optional/email.sql by hand later, if ever.",
-        "  - Scheduling. Every task stays suspended; add no schedule until a",
-        "    successful bounded proof and a coverage review.",
+        "Not run by this tool: AI inference, email, or scheduling.",
         "",
         "This harness ran no SQL. Nothing above has been executed.",
     ]
@@ -322,15 +395,22 @@ def action_render(args):
     documents = []
     for name in INSTALL_FILES + TEST_FILES:
         documents.append((name, render_text(read_source(name), values)))
+    rendered = dict(documents)
 
-    written = []
+    # Derive CLI files after substitution.
+    cli_tasks, task_count = cli_safe_tasks(rendered["sql/06_tasks.sql"])
+    documents.append((CLI_TASKS, cli_tasks))
+    documents.append(
+        (CLI_TEST_PAIR, test_pair(rendered["tests/fixtures.sql"], rendered["tests/assertions.sql"]))
+    )
+
+    written = {}
     for name, text in documents:
         target = out / name
         write_file(target, text, args.force)
-        written.append(target)
+        written[name] = display_path(target)
 
-    relative = [display_path(path) for path in written]
-    lines = plan_lines(settings, display_path(out), relative, args.connection)
+    lines = plan_lines(settings, display_path(out), written, task_count, args.connection)
     plan_path = out / "PLAN.txt"
     write_file(plan_path, "\n".join(lines) + "\n", True)
     print("\n".join(lines))

@@ -159,6 +159,7 @@ AS
 $$
     COALESCE(
         IS_OBJECT(result)
+        AND ARRAY_SIZE(OBJECT_KEYS(result)) = 13
         AND IS_BOOLEAN(result:recommendation_warranted)
         AND IS_VARCHAR(result:headline)
         AND LENGTH(TRIM(result:headline::VARCHAR)) > 0

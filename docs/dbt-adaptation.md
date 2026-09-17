@@ -1,12 +1,12 @@
 # dbt Adaptation
 
-**Design only. Experimental; clean-install validation is pending.** This repository does not include a dbt project, YAML configuration, models, or a tested dbt integration. None is required to use the SQL installation. This is Dylan Kahn's personal, as-is project, not official, supported, or endorsed by Snowflake. No license has been chosen.
+**Design only.** This repository does not include or test a dbt project. The SQL install does not require dbt.
 
-The useful boundary is simple: persist AI results once for a specific set of inputs, then let dbt transform those stored results. Do not put inference in dashboard views or make ordinary analytical queries call the model again.
+The useful boundary is simple: save AI results once for a specific set of inputs, then let dbt transform those stored results. Do not put inference in dashboard views or make ordinary analytical queries call the model again.
 
 ## Proposed Mapping
 
-These are design mappings, not new files or objects supplied by this repository.
+These are possible mappings. This repository does not supply them.
 
 | Current contract | Possible dbt responsibility |
 | --- | --- |
@@ -23,7 +23,7 @@ Preserve the existing-agent-only scope. Use the approved output database/schema 
 
 ## Incremental AI Boundary
 
-1. Capture evidence and the current agent specification before building candidate inputs. Do not label the snapshot as historical invocation configuration.
+1. Capture evidence and the current agent specification before building candidate inputs. Do not present the snapshot as the configuration used by an earlier call.
 2. Construct deterministic evidence IDs. The current diagnosis identity includes agent/thread and trace identities, turn/context hashes, config hash, model, and prompt revision. A model or evidence change should not silently reuse an old result.
 3. Anti-join candidates to every persisted diagnosis ID before approved inference, including `valid`, `invalid_output`, and `ai_error`. Preserve immutable inference results. Retrying unchanged inputs requires an explicit new `prompt_revision`, creates a new identity, and can incur new charges; it must not overwrite the old result.
 4. Materialize model output, validation status, error metadata, and result identity in an incremental table. A configured dbt `unique_key` or merge strategy is not an enforced unique constraint or cross-session lock. Serialize writers and test uniqueness.
@@ -55,6 +55,6 @@ Validation work should cover:
 - Supported surfaces, output enums/types, evidence quotes, citations, replacement scope, and preserved good behavior.
 - Run-level omission/error accounting and restricted dashboard exposure, including empty runs.
 
-`tests/test_contracts.py`, `tests/fixtures.sql`, and `tests/assertions.sql` are planned, not proof of completed tests. Verify their presence before using them. Keep fixtures synthetic and isolated from runtime agent capture. Static checks cannot replace an approved clean installation, Snowflake compilation, task-owner access checks, and a bounded inference/search proof.
+The offline tests check source contracts, not Snowflake compilation or live behavior. Keep fixtures synthetic and separate from runtime agent capture. Test a dbt version in an approved disposable environment before use.
 
 Do not add an email post-hook or send mail during dbt builds. Optional delivery remains a separate, human-approved operation using an existing integration and a serialized delivery ledger. Start with manual builds; scheduling requires its own approval after validation and cost/coverage review.

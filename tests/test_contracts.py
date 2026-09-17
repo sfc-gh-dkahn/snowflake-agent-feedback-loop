@@ -11,12 +11,25 @@ SQL fixtures/assertions must be run separately, later, in a disposable installat
 import ast
 import json
 import re
+import sys
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Use the same statement splitter as the renderer.
+sys.path.insert(0, str(ROOT / "tools"))
+
+from sql_lexer import (  # noqa: E402
+    Token,
+    definition,
+    lex,
+    qualified_identifier,
+    statement_source,
+    statements,
+    values,
+)
 CONTEXT = "USE DATABASE __OUTPUT_DATABASE__; USE SCHEMA __OUTPUT_SCHEMA__;"
 IDENTITY = "agent_database agent_schema agent_name"
 DIAGNOSIS_FIELDS = (
@@ -66,154 +79,9 @@ TASK_CALLS = {
 }
 
 
-@dataclass(frozen=True)
-class Token:
-    kind: str
-    value: str
-    offset: int
-
-
-def lex(source):
-    """Lex Snowflake's untagged $$ delimiter; quoted/commented $$ is not a body."""
-    tokens = []
-    cursor = 0
-    while cursor < len(source):
-        start = cursor
-        character = source[cursor]
-        if character.isspace():
-            cursor += 1
-        elif source.startswith("--", cursor):
-            end = source.find("\n", cursor)
-            cursor = len(source) if end == -1 else end + 1
-        elif source.startswith("/*", cursor):
-            depth = 1
-            cursor += 2
-            while cursor < len(source) and depth:
-                if source.startswith("/*", cursor):
-                    depth += 1
-                    cursor += 2
-                elif source.startswith("*/", cursor):
-                    depth -= 1
-                    cursor += 2
-                else:
-                    cursor += 1
-            if depth:
-                raise ValueError(f"Unterminated block comment at offset {start}")
-        elif character in ("'", '"'):
-            delimiter = character
-            cursor += 1
-            content = []
-            while cursor < len(source):
-                character = source[cursor]
-                if character == delimiter:
-                    if source.startswith(delimiter * 2, cursor):
-                        content.append(delimiter)
-                        cursor += 2
-                        continue
-                    cursor += 1
-                    break
-                if delimiter == "'" and character == "\\":
-                    if cursor + 1 == len(source):
-                        raise ValueError(f"Unterminated escape at offset {cursor}")
-                    escaped = source[cursor + 1]
-                    content.append({"n": "\n", "r": "\r", "t": "\t"}.get(escaped, escaped))
-                    cursor += 2
-                else:
-                    content.append(character)
-                    cursor += 1
-            else:
-                raise ValueError(f"Unterminated quoted token at offset {start}")
-            tokens.append(Token("string" if delimiter == "'" else "identifier", "".join(content), start))
-        elif source.startswith("$$", cursor):
-            end = source.find("$$", cursor + 2)
-            if end == -1:
-                raise ValueError(f"Unterminated dollar body at offset {start}")
-            tokens.append(Token("dollar", source[cursor + 2:end], start))
-            cursor = end + 2
-        else:
-            match = re.match(r"[A-Za-z_][A-Za-z0-9_$]*|[0-9]+|=>|::|:=|\|\||<>", source[cursor:])
-            value = match.group() if match else character
-            tokens.append(Token("word" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", value) else "symbol", value, start))
-            cursor += len(value)
-    return tokens
-
-
-def values(tokens):
-    return [token.value.upper() if token.kind == "word" else token.value for token in tokens]
-
-
 def code(tokens):
     return " ".join(token.value.upper() if token.kind == "word" else token.value
                     for token in tokens if token.kind not in {"string", "dollar"})
-
-
-def qualified_identifier(tokens, start):
-    parts = []
-    cursor = start
-    while True:
-        if cursor >= len(tokens) or tokens[cursor].kind not in {"word", "identifier"} or not tokens[cursor].value:
-            raise ValueError(f"Expected identifier at token {cursor}")
-        parts.append(values(tokens[cursor:cursor + 1])[0])
-        cursor += 1
-        if cursor >= len(tokens) or tokens[cursor].kind != "symbol" or tokens[cursor].value != ".":
-            return parts, cursor
-        if len(parts) == 3:
-            raise ValueError("Object identifier has more than three parts")
-        cursor += 1
-
-
-def definition(tokens):
-    words = values(tokens)
-    if not words or tokens[0].kind != "word" or words[0] != "CREATE":
-        return None
-    cursor = 1
-    if words[cursor:cursor + 2] == ["OR", "REPLACE"]:
-        cursor += 2
-    if words[cursor:cursor + 1] == ["TEMPORARY"]:
-        cursor += 1
-    if cursor >= len(tokens) or tokens[cursor].kind != "word":
-        raise ValueError("Expected CREATE object kind")
-    kind = words[cursor]
-    cursor += 1
-    if words[cursor:cursor + 3] == ["IF", "NOT", "EXISTS"]:
-        cursor += 3
-    parts, cursor = qualified_identifier(tokens, cursor)
-    return kind, parts[-1], cursor
-
-
-def statements(source):
-    """Split lexical statements, preserving unquoted CREATE TASK scripting bodies."""
-    result = []
-    current = []
-    stack = []
-    scripting = False
-    after_end = False
-    for token in lex(source):
-        current.append(token)
-        words = values(current)
-        if words[:2] == ["CREATE", "TASK"] and token.kind == "word" and words[-1] == "DECLARE":
-            scripting = True
-        if scripting and token.kind == "word":
-            word = words[-1]
-            if after_end and word in {"IF", "FOR", "LOOP", "CASE", "WHILE"}:
-                after_end = False
-            elif word == "END":
-                if not stack:
-                    raise ValueError(f"Unmatched task END at {token.offset}")
-                stack.pop()
-                after_end = True
-            elif word in {"BEGIN", "IF", "FOR", "CASE", "WHILE", "LOOP"}:
-                stack.append(word)
-                after_end = False
-        if token.kind == "symbol" and token.value == ";":
-            if not stack and (not scripting or after_end):
-                result.append(current)
-                current = []
-                scripting = False
-            after_end = False
-    if stack or current:
-        raise ValueError("Unclosed scripting block or missing final statement terminator")
-    return result
 
 
 def nested_tokens(tokens):
@@ -655,10 +523,32 @@ class SourceContractTests(unittest.TestCase):
                 mocks = [json.loads(text) for text in assertion_strings if text.startswith('{"assessment":') or text.startswith('{"recommendation_warranted":')]
                 matching = [mock for mock in mocks if set(mock) == set(fields)]
                 self.assertEqual(len(matching), 1)
-        self.assertFalse(recommendation_schema["additionalProperties"])
+        self.assertNotIn("additionalProperties", recommendation_schema)
         citations = recommendation_schema["properties"]["citations"]["items"]
+        self.assertFalse(citations["additionalProperties"])
         self.assertEqual(set(citations["properties"]), {"url", "quote", "supports"})
         self.assertCountEqual(citations["required"], ["url", "quote", "supports"])
+
+    def test_recommendation_schema_avoids_non_gpt_root_rejection(self):
+        """Only GPT models accept the strict root used by their schema convention."""
+        source = self.sources["sql/05_recommend.sql"]
+        recommend = list(nested_tokens(self.definitions[("PROCEDURE", "AF_RECOMMEND")]))
+        schema_text = next(token.value for token in recommend
+                           if token.kind == "string" and token.value.lstrip().startswith('{\n        "type": "json"'))
+        schema = json.loads(schema_text)["schema"]
+        self.assertNotIn("additionalProperties", schema)
+        call = next(arguments for function_name, arguments in ai_calls(recommend)
+                    if function_name == "AI_COMPLETE")
+        response_format = next(part for part in comma_parts(call)
+                               if values(part)[:2] == ["RESPONSE_FORMAT", "=>"])
+        self.assertEqual(values(response_format), ["RESPONSE_FORMAT", "=>", ":", "RESPONSE_SCHEMA"])
+        self.assertRegex(source, r"IF \(REGEXP_INSTR\(judge_model, '[^']*gpt[^']*'")
+        self.assertRegex(source, r"response_schema := OBJECT_INSERT\(response_schema, 'schema',\s*\n"
+                                 r"\s*OBJECT_INSERT\(response_schema:schema, 'additionalProperties', FALSE, TRUE\), TRUE\);")
+        validator = code(list(nested_tokens(
+            self.definitions[("FUNCTION", "AF_RECOMMENDATION_VALID")]
+        )))
+        self.assertIn("ARRAY_SIZE ( OBJECT_KEYS ( RESULT ) ) = 13", validator)
 
     def test_recommendation_gate_admits_same_thread_recurrence(self):
         """A multi-turn episode in one thread must be able to qualify on its own.
@@ -787,8 +677,8 @@ class SourceContractTests(unittest.TestCase):
 
     def test_sql_carries_no_domain_or_deployment_specific_literals(self):
         """The kit ships generic. A worked example must not leak into the template."""
-        forbidden = r"\b(?:mlb|braves|baseball|roster|inning|ballpark|athlete|franchise|" \
-                    r"snowhouse|demo_acc|kahn)\b"
+        forbidden = r"\b(?:customer[_ -]?name|account[_ -]?name|private[_ -]?agent|" \
+                    r"real[_ -]?thread|real[_ -]?trace)\b|/Users/"
         for name, source in self.sources.items():
             with self.subTest(file=name):
                 self.assertIsNone(re.search(forbidden, source, re.I))

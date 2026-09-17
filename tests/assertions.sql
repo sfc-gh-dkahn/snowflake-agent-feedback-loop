@@ -1,14 +1,7 @@
--- README: Run only AFTER fixtures.sql, in the SAME SESSION and OPEN transaction.
--- Use the SAME installed, dedicated disposable schema. Never production.
--- Stop on error. Do not COMMIT, run DDL, run procedures, or enable tasks between files.
--- This block returns a summary on success; on failure it SELECTs names/details then
--- raises an exception. Inspect that SELECT in query history if the client hides it.
--- Rollback occurs before the assertion exception and on other errors after the guard.
--- If the guard cannot identify the fixture transaction, it leaves it untouched:
--- inspect the session and run ROLLBACK yourself if fixtures were interrupted.
--- Mocks test validator contracts only, not LLM judgment, factual support, or quality.
--- Extra-key/citation-content rejection belongs to procedure validation, not these UDFs.
--- Authored offline: static tests are NOT Snowflake compilation or live execution.
+-- Run after fixtures.sql in the same disposable session and open transaction.
+-- With Snow CLI, use the rendered fixture_pair.cli.sql instead.
+-- Stop on error. The checks use synthetic data and call no AI.
+-- On failure, inspect the preceding result in query history and roll back the session.
 
 USE DATABASE __OUTPUT_DATABASE__;
 USE SCHEMA __OUTPUT_SCHEMA__;
@@ -186,10 +179,7 @@ BEGIN
                 'recommendation_warranted', FALSE, TRUE), 'change_mode', 'none', TRUE), 'suggested_change', '', TRUE), TRUE
             FROM verdicts WHERE kind = 'recommendation'
             UNION ALL
-            -- Two-part reported-gap advice: both fields are typed strings the validator
-            -- must accept when populated. Whether each is required is decided per group
-            -- inside AF_RECOMMEND, which knows the target surface; the contract here is
-            -- only that populated advice stays valid and a non-string never does.
+            -- AF_RECOMMEND decides when both reported-gap fields are required.
             SELECT kind, 'gap_two_part_populated', OBJECT_INSERT(OBJECT_INSERT(payload::OBJECT,
                 'data_gap_investigation', 'Check whether the reported scope is absent.', TRUE),
                 'unknown_data_response_guidance', 'Say the coverage is unknown and route to the approved contact path.', TRUE), TRUE
@@ -302,10 +292,7 @@ BEGIN
 END;
 $$;
 
--- Transaction control stays at session scope. Snowflake refuses to let a
--- scripting block modify a transaction that began outside its own scope, so
--- the rollback cannot live inside the block above. If the block raised, this
--- statement does not run and disconnecting discards the uncommitted rows.
+-- The session opened the transaction, so rollback stays at session scope.
 ROLLBACK;
 
 EXECUTE IMMEDIATE $$

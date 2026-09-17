@@ -71,9 +71,7 @@ DECLARE
     ai_error_detail VARCHAR;
     response_text VARCHAR;
     response_chars INTEGER;
-    -- Prompt and output bounds. max_output_tokens must equal the max_tokens literal in
-    -- the AI_COMPLETE call below; a default output cap truncates the JSON and the
-    -- function then returns NULL rather than an error.
+    -- Keep this value equal to AI_COMPLETE.max_tokens below.
     max_output_tokens INTEGER DEFAULT 8192;
     sample_limit INTEGER DEFAULT 3;
     counterevidence_limit INTEGER DEFAULT 2;
@@ -121,7 +119,6 @@ DECLARE
         "type": "json",
         "schema": {
             "type": "object",
-            "additionalProperties": false,
             "properties": {
                 "recommendation_warranted": {"type": "boolean"},
                 "headline": {"type": "string"},
@@ -168,6 +165,10 @@ BEGIN
     IF (LENGTH(TRIM(judge_model)) = 0 OR LENGTH(TRIM(prompt_revision)) = 0
         OR max_recommendations < 0 OR min_occurrences < 1 OR docs_cache_hours < 0) THEN
         RAISE invalid_contract;
+    END IF;
+    IF (REGEXP_INSTR(judge_model, '(^|[^A-Za-z0-9])gpt([-_.]|$)', 1, 1, 0, 'i') > 0) THEN
+        response_schema := OBJECT_INSERT(response_schema, 'schema',
+            OBJECT_INSERT(response_schema:schema, 'additionalProperties', FALSE, TRUE), TRUE);
     END IF;
     SELECT COUNT(*) INTO :invalid_count
     FROM (
@@ -222,8 +223,7 @@ BEGIN
             FROM prior_flat WHERE recency_rank <= :evidence_prior_turns
             GROUP BY agent_database, agent_schema, agent_name, response_trace_id, feedback_trace_id
         ), valid_rows AS (
-            -- The prompt payload is bounded here, not at the call site: full turn evidence
-            -- from one busy thread is large enough to crowd out the model's own output.
+            -- Bound the evidence before building the prompt.
             SELECT latest.*, OBJECT_CONSTRUCT(
                 'response_trace_id', latest.response_trace_id,
                 'feedback_trace_id', latest.feedback_trace_id,
@@ -278,11 +278,8 @@ BEGIN
             JOIN fingerprints USING (agent_database, agent_schema, agent_name,
                                      response_trace_id, feedback_trace_id)
         ), thread_signatures AS (
-            -- Recurrence within one thread, measured per surface and issue_type. A multi-turn
-            -- episode is one problem restated, so an 'unclear' turn on the same signature
-            -- still counts as a recurrence -- but only where a 'poor' turn anchors it, so a
-            -- group is never formed from uncertain readings alone. Generic: no agent, thread,
-            -- surface, or issue_type is special-cased.
+            -- Count repeated evidence only within one thread, surface, and issue type.
+            -- At least one poor turn must anchor the group.
             SELECT agent_database, agent_schema, agent_name, thread_id,
                    diagnosis:surface::VARCHAR AS surface,
                    diagnosis:issue_type::VARCHAR AS issue_type,
@@ -303,8 +300,7 @@ BEGIN
             WHERE thread_has_poor = 1 AND thread_trace_count > 1
             GROUP BY agent_database, agent_schema, agent_name, surface
         ), corroborating AS (
-            -- The turns that make the episode recurrent are shown to the model as
-            -- corroboration, kept separate from the poor examples and never treated as proof.
+            -- Keep unclear repeated turns separate from poor examples.
             SELECT agent_database, agent_schema, agent_name, surface,
                    ARRAY_AGG(payload) WITHIN GROUP (
                        ORDER BY response_trace_id, feedback_trace_id) AS corroborating_evidence,
@@ -586,9 +582,7 @@ BEGIN
                         show_details => FALSE,
                         return_error_details => TRUE
                     ) INTO :ai_envelope;
-                    -- return_error_details wraps the answer as {value, error}. Without it a
-                    -- model-side failure is indistinguishable from an empty answer: both arrive
-                    -- as SQL NULL with no error raised, so nothing survives for a reviewer.
+                    -- return_error_details separates model errors from empty answers.
                     IF (IS_OBJECT(ai_envelope)
                         AND ARRAY_CONTAINS('value'::VARIANT, OBJECT_KEYS(ai_envelope))
                         AND ARRAY_CONTAINS('error'::VARIANT, OBJECT_KEYS(ai_envelope))) THEN
@@ -689,9 +683,7 @@ BEGIN
                         row_error := 'AI/validation error (' || SQLSTATE || '): ' || SQLERRM;
                         ai_errors := ai_errors + 1;
                 END;
-                -- Keep the failure readable. raw_output is NULL in exactly the cases a reviewer
-                -- most needs to see, so the response head, sizes, and any model error are
-                -- retained on the evidence object instead of being discarded.
+                -- Save bounded debug fields when raw_output is NULL.
                 evidence := OBJECT_INSERT(evidence, 'ai_response_debug', OBJECT_CONSTRUCT_KEEP_NULL(
                     'prompt_chars', LENGTH(prompt), 'response_chars', response_chars,
                     'response_text_head', NULLIF(response_text, ''), 'model_error', ai_error_detail,

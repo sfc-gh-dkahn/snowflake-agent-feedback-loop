@@ -11,6 +11,7 @@ import ast
 import contextlib
 import importlib.util
 import io
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,7 +54,7 @@ def quietly(handler, args):
 
 class ValidationTests(unittest.TestCase):
     def test_identifier_accepts_uppercase_forms(self):
-        for value in ("A", "_X", "MLB_DATA", "T$1", "A" * 255):
+        for value in ("A", "_X", "SAMPLE_DATA", "T$1", "A" * 255):
             self.assertEqual(harness.check_identifier(value, "x"), value)
 
     def test_identifier_refuses_bad_forms(self):
@@ -134,13 +135,8 @@ class RenderActionTests(unittest.TestCase):
         (harness.ROOT / "sql").mkdir(parents=True)
         (harness.ROOT / "tests").mkdir(parents=True)
         for name in harness.INSTALL_FILES + harness.TEST_FILES:
-            (harness.ROOT / name).write_text(
-                "USE DATABASE __OUTPUT_DATABASE__;\nUSE SCHEMA __OUTPUT_SCHEMA__;\n"
-                "-- __AGENT_DATABASE__ __AGENT_SCHEMA__ __AGENT_NAME__\n"
-                "-- __JUDGE_MODEL__ WAREHOUSE = __WAREHOUSE__\n"
-                "AND NOT CONTAINS(x, '__')\n",
-                encoding="utf-8",
-            )
+            source = ROOT / name
+            shutil.copyfile(source, harness.ROOT / name)
         self.addCleanup(self.restore)
 
     def restore(self):
@@ -153,6 +149,25 @@ class RenderActionTests(unittest.TestCase):
             self.assertIn("OUTDB", text)
             self.assertEqual(harness.PLACEHOLDER.findall(text), [], name)
         self.assertTrue((self.out / "PLAN.txt").is_file())
+        self.assertTrue((self.out / harness.CLI_TASKS).is_file())
+        self.assertTrue((self.out / harness.CLI_TEST_PAIR).is_file())
+
+    def test_cli_task_file_wraps_each_task_without_changing_it(self):
+        quietly(harness.action_render, args_for("render", self.out))
+        original = (self.out / "sql" / "06_tasks.sql").read_text(encoding="utf-8")
+        derived = (self.out / harness.CLI_TASKS).read_text(encoding="utf-8")
+        self.assertEqual(derived.count("EXECUTE IMMEDIATE $$\nCREATE TASK "), 7)
+        for body in harness.task_bodies(original).values():
+            self.assertIn("EXECUTE IMMEDIATE $$\n%s\n$$;" % body, derived)
+
+    def test_plan_uses_cli_safe_tasks_and_one_session_test_pair(self):
+        quietly(harness.action_render, args_for("render", self.out))
+        plan = (self.out / "PLAN.txt").read_text(encoding="utf-8")
+        self.assertIn("-f local/render/%s" % harness.CLI_TASKS, plan)
+        self.assertIn("-f local/render/%s" % harness.CLI_TEST_PAIR, plan)
+        self.assertNotIn("-f local/render/sql/06_tasks.sql", plan)
+        self.assertNotIn("-f local/render/tests/fixtures.sql", plan)
+        self.assertNotIn("-f local/render/tests/assertions.sql", plan)
 
     def test_plan_lists_install_files_in_order(self):
         quietly(harness.action_render, args_for("render", self.out))
@@ -251,7 +266,9 @@ class SafetyTests(unittest.TestCase):
         return names
 
     def test_harness_imports_only_the_standard_library(self):
-        self.assertLessEqual(self.imported_names(), {"argparse", "re", "sys", "pathlib"})
+        self.assertLessEqual(
+            self.imported_names(), {"argparse", "re", "sys", "pathlib", "sql_lexer"}
+        )
 
     def test_harness_imports_no_execution_or_network_module(self):
         forbidden = {"subprocess", "socket", "urllib", "http", "requests", "snowflake", "os"}

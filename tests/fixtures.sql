@@ -1,14 +1,8 @@
--- README: OFFLINE-AUTHORED TEST INPUT. NOT EXECUTED OR COMPILED AGAINST SNOWFLAKE.
--- Install sql/00_setup.sql through sql/06_tasks.sql LATER in a NEW, dedicated,
--- disposable schema created solely for this test. Never use a production schema.
--- Replace __OUTPUT_DATABASE__ and __OUTPUT_SCHEMA__ with that SAME install target.
--- Keep all tasks suspended; use a single session, AUTOCOMMIT enabled, no concurrent
--- writers, and a client that STOPS ON ERROR. Do not run install SQL between these files.
--- Run fixtures.sql, then assertions.sql IN THE SAME SESSION without disconnecting.
--- This file leaves a transaction OPEN. Assertions roll it back on pass or failure.
--- If interrupted or any statement fails, run ROLLBACK in this session immediately.
--- No COMMIT, DDL, procedure CALL, or LLM execution is allowed after BEGIN TRANSACTION.
--- Temporary fixture data survives rollback until the session ends. All data is synthetic.
+-- Run only in a new disposable installation with all tasks suspended.
+-- Use AUTOCOMMIT and no other writers. All rows are synthetic.
+-- This file opens a transaction. Run assertions.sql next in the same session.
+-- With Snow CLI, use the rendered fixture_pair.cli.sql instead.
+-- If the session stays open after an error, run ROLLBACK.
 
 USE DATABASE __OUTPUT_DATABASE__;
 USE SCHEMA __OUTPUT_SCHEMA__;
@@ -138,9 +132,7 @@ BEGIN
     FROM AF_FIXTURE_EVENTS;
 EXCEPTION
     WHEN OTHER THEN
-        -- No ROLLBACK here: the transaction began at session scope and
-        -- Snowflake refuses to let this block modify it. Nothing is committed,
-        -- so run ROLLBACK yourself in this session, or disconnect.
+        -- The session owns this transaction. Roll it back outside this block.
         RAISE;
 END;
 $$;
