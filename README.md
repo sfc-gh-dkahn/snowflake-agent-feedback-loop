@@ -11,7 +11,61 @@ is a set of findings and proposed changes for a person to review, not agent edit
 or run in Snowflake. This is not production-certified or an official Snowflake
 project. This personal project has no license.
 
-## Follow the Data
+## From Conversation to Recommendation
+
+The next user message can help explain how an answer landed. The loop saves that
+evidence, looks for recurring issues, and drafts suggestions for a person to review.
+
+```mermaid
+flowchart TD
+    capture["02 - Capture agent events<br/>Save conversations and current settings"]
+    rebuild["03 - Rebuild the conversation<br/>Question, answer, tools and follow-up"]
+    pair{"Adjacent complete turns<br/>in the same thread?"}
+    unjudged["Keep unjudged<br/>No conclusion about answer quality"]
+    review["04 - Review the answer<br/>Save findings, exact evidence and errors"]
+    good["Good<br/>Keep examples of what worked"]
+    unclear["Unclear<br/>Do not assume failure"]
+    issues["Poor behavior or reported data gap<br/>Group observations by change area"]
+    docs["05 - Retrieve official documentation<br/>Save passages for citation checks"]
+    gate{"06 - Enough observations<br/>and fresh, usable docs?"}
+    waiting["Keep visible in the queue<br/>Below threshold or blocked by docs"]
+    recommend["06 - Draft a recommendation<br/>Compare good examples and cite docs"]
+    inspect["07 - Inspect results<br/>Suggestions, deferred work and failures"]
+    human["Human decides what to change<br/>Nothing updates the agent automatically"]
+
+    capture --> rebuild --> pair
+    pair -->|No| unjudged
+    pair -->|Yes| review
+    review --> good
+    review --> unclear
+    review --> issues
+    issues --> gate
+    docs --> gate
+    gate -->|No| waiting
+    gate -->|Yes, within call limit| recommend
+    good -.->|Preserve successful behavior| recommend
+    recommend --> inspect --> human
+    waiting --> inspect
+    review -.->|Saved errors remain visible| inspect
+
+    classDef process fill:#e8f6fc,stroke:#29b5e8,color:#11344a;
+    classDef decision fill:#fff4dc,stroke:#bd8521,color:#49350f;
+    classDef retained fill:#f1f3f5,stroke:#8493a0,color:#253746;
+    classDef outcome fill:#e8f5ed,stroke:#3c8c60,color:#163c26;
+    class capture,rebuild,review,docs,recommend process;
+    class pair,gate decision;
+    class unjudged,unclear,waiting retained;
+    class good,inspect,human outcome;
+```
+
+**Before capture:** 00 sets the review window and limits; 01 checks readiness.
+Follow-ups are clues, not ratings. A reported data gap can occur even when the
+answer was good or unclear; it is a separate investigation signal, not confirmed
+missing data. Saved failures and work over the call limit remain visible. Email
+is an optional manual step, not the end of an automatic schedule.
+
+<details>
+<summary>Expand the table and view lineage</summary>
 
 ```text
 00: REVIEW_SETTINGS + CHANGE_AREAS -> scope, limits and review categories
@@ -31,6 +85,8 @@ project. This personal project has no license.
     -> paid AI -> RECOMMENDATIONS -> RECOMMENDATION_RESULTS -> REVIEW_QUEUE
 07: saved evidence + views + results -> coverage, backlog and error counts
 ```
+
+</details>
 
 ## Before You Start
 
