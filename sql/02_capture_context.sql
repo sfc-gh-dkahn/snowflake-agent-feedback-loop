@@ -9,17 +9,17 @@
 -- Customize before running:
 --   1. Replace OUTPUT_DB and AGENT_FEEDBACK with an existing output location.
 --   2. Replace AGENT_DB, AGENT_SCHEMA, and AGENT_NAME everywhere in this file.
---   3. Change the two UTC dates in events_in_review_window below.
+--   3. Set the UTC window in REVIEW_SETTINGS, created by 00_setup.sql.
 -- Use one agent per output schema. Select a role and warehouse that can read
 -- that agent's events/settings and create and write these output tables.
+-- Run 01_preflight.sql first and fix any invalid settings before continuing.
 --
 -- Run each statement in order and stop if one fails. The DESCRIBE ->> INSERT
 -- chain is one statement: submit it separately, through its ending semicolon.
 -- Do not run two copies at once. Each write commits separately with AUTOCOMMIT
 -- enabled; this file does not roll back earlier successful statements on failure.
 --
--- This is the first plain-SQL pilot. It does not use the old AF_* objects or
--- procedures. The other numbered scripts are not yet adapted to these tables.
+-- Capture needs only REVIEW_SETTINGS and the source agent, not later views.
 -- No AI calls, emails, schedules, or changes to the agent happen here.
 
 USE DATABASE OUTPUT_DB;
@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS AGENT_EVENTS (
 -- These settings describe the agent NOW. They do not prove which instructions
 -- or model produced older answers. Every execution adds a dated snapshot,
 -- even if the settings have not changed. No snapshot is treated as a run ID.
+-- This snapshot write is independent of the review window: it still saves if
+-- REVIEW_SETTINGS is invalid. The event guard below does not undo this write.
 
 DESCRIBE AGENT AGENT_DB.AGENT_SCHEMA.AGENT_NAME
     ->> INSERT INTO AGENT_SETTINGS_HISTORY (
@@ -113,7 +115,9 @@ LIMIT 1;
 -- =============================================================================
 -- This reads all conversations for ONE agent in the selected window. Keep tool
 -- events even when they have no thread ID; their trace ID links them to a turn.
--- Conversation filtering belongs after those links have been rebuilt.
+-- thread_filter narrows reviews in 04, NOT capture. Filtering spans by thread
+-- here would drop tool evidence. 03 rebuilds turns from the full saved history.
+-- The window can still cut a turn at either edge; capture is not full coverage.
 --
 -- MERGE writes to AGENT_EVENTS. Existing rows are left untouched. Rerunning an
 -- overlapping window picks up late events without duplicating identical ones.
@@ -122,12 +126,38 @@ LIMIT 1;
 
 MERGE INTO AGENT_EVENTS AS saved_events
 USING (
-    WITH events_in_review_window AS (
+    WITH settings_with_count AS (
+        -- Count BEFORE filtering so extra invalid rows cannot hide a duplicate.
+        SELECT REVIEW_SETTINGS.*, COUNT(*) OVER () AS settings_rows
+        FROM REVIEW_SETTINGS
+    ),
+
+    valid_settings AS (
+        -- Same full guard as preflight. Invalid settings select no events;
+        -- read preflight's status to distinguish that from a valid empty window.
+        SELECT review_start, review_end
+        FROM settings_with_count
+        WHERE settings_rows = 1
+          AND settings_id = 1
+          AND review_start < review_end
+          AND review_end <= DATEADD('minute', -15, SYSDATE())
+          AND review_end <= DATEADD('day', 90, review_start)
+          AND (thread_filter IS NULL
+               OR (LENGTH(TRIM(thread_filter, ' \t\r\n')) > 0 AND TRIM(thread_filter, ' \t\r\n') <> '0'))
+          AND max_new_reviews BETWEEN 1 AND 100
+          AND max_new_recommendations BETWEEN 1 AND 20
+          AND min_occurrences BETWEEN 1 AND 1000
+          AND docs_max_age_hours BETWEEN 1 AND 720
+          AND LENGTH(TRIM(prompt_revision, ' \t\r\n')) > 0
+    ),
+
+    events_in_review_window AS (
         -- One row per recorded span. Use the agent-scoped function rather than
         -- reading the account-wide event table. Start is inclusive; end is not.
-        -- The dates below are UTC examples: replace both before running.
+        -- Source timestamp is UTC NTZ, just like the settings window. Do not
+        -- interpret it as session-local time through a direct LTZ cast.
         SELECT
-            timestamp AS recorded_at,
+            timestamp::TIMESTAMP_NTZ AS recorded_at,
             trace,
             record,
             record_attributes
@@ -137,16 +167,19 @@ USING (
             'AGENT_NAME',
             'CORTEX AGENT'
         ))
-        WHERE timestamp >= '2026-09-01 00:00:00'::TIMESTAMP_NTZ
-          AND timestamp < '2026-09-02 00:00:00'::TIMESTAMP_NTZ
-          AND record_type = 'SPAN'
-          AND NULLIF(TRIM(trace:trace_id::VARCHAR), '') IS NOT NULL
+        JOIN valid_settings
+          ON timestamp::TIMESTAMP_NTZ >= valid_settings.review_start
+         AND timestamp::TIMESTAMP_NTZ < valid_settings.review_end
+        WHERE record_type = 'SPAN'
+          AND NULLIF(TRIM(trace:trace_id::VARCHAR, ' \t\r\n'), '') IS NOT NULL
     ),
 
     readable_events AS (
         -- Extract the useful fields from Snowflake's event JSON. These are still
         -- individual events, not complete question/answer pairs. NULL fields are
         -- expected: a tool event and a response event contain different details.
+        -- Numeric epoch nanoseconds build LTZ from UTC, not the session zone;
+        -- only its display changes with TIMEZONE. Keep all nine fractional digits.
         SELECT
             'AGENT_DB' AS agent_database,
             'AGENT_SCHEMA' AS agent_schema,
@@ -169,7 +202,8 @@ USING (
 
     events_with_identifiers AS (
         -- Hash the agent identity and selected fields to recognize repeat rows.
-        -- Keep the field order and timestamp precision stable between runs.
+        -- Keep the field order and numeric epoch nanoseconds stable between runs:
+        -- no session timestamp format or display zone participates in this hash.
         -- Changes to these fields produce a new row rather than replacing evidence.
         SELECT
             readable_events.*,
@@ -247,6 +281,6 @@ FROM AGENT_EVENTS
 ORDER BY event_time DESC, trace_id, event_hash
 LIMIT 20;
 
--- Next step: rebuild complete conversation turns from AGENT_EVENTS, then pair
--- each answer with its next user message. That script will be revised after
--- this pilot's structure and naming have been reviewed.
+-- Next: 03_prepare_feedback.sql rebuilds turns from AGENT_EVENTS, preserving
+-- incomplete turns before pairing adjacent complete turns in the same thread.
+-- Answers without a complete adjacent follow-up stay unjudged.

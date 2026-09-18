@@ -7,7 +7,7 @@
 -- only if definitions changed), 04, manually refresh docs with 05 as needed,
 -- then 06 and 07. Require fresh, ready exact-query docs before 06; a full 05
 -- run makes eight paid searches. Never proceed using old docs after a failed refresh.
--- Align 02's literal capture dates with the intended REVIEW_SETTINGS window.
+-- 02 reads the REVIEW_SETTINGS UTC window; thread_filter narrows reviews, not capture.
 -- 04 is not optional: it saves new reviews. Recreate its views when definitions
 -- change, and rerun 04 for a changed prompt_revision before running 06.
 -- Keep every statement within 04 in one session, and likewise within 06, because
