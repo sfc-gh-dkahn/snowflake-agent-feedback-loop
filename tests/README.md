@@ -65,8 +65,7 @@ Official-looking URLs and passages are invented test data, not documentation cla
 The suite checks view logic, identities, saved-error reuse, strict types, exact quotes,
 same-surface replacements, investigation-only gaps and settings/docs gates. Mutation
 UPDATE/DELETE statements belong ONLY to fixtures, never the append-only production path.
-No copied view implementation or renderer is maintained here. Legacy source-contract
-and renderer tests do not apply to this refactor; their removal belongs to step 11.
+No copied view implementation or renderer is maintained here.
 This suite has been authored and statically checked, **not compiled or executed**.
 It does not prove live API contracts, privileges, capture MERGE behavior, frozen paid
 batch execution, model/schema/template version edits, concurrency or exactly-once cost.
