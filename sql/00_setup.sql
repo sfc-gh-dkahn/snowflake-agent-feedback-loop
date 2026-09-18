@@ -318,9 +318,12 @@ checks AS (
             <= DATEADD('minute', -15, SYSDATE()) AS window_end_settled,
 
         -- A very long window is usually a typo, and it is also the setting
-        -- most likely to turn one run into a large bill.
-        DATEDIFF('day', settings_state.review_start, settings_state.review_end)
-            <= 90 AS window_span_sensible,
+        -- most likely to turn one run into a large bill. DATEADD measures exact
+        -- elapsed time; DATEDIFF('day', ...) counts midnight boundaries crossed,
+        -- so it passed a window of 90 days plus 23 hours.
+        settings_state.review_end
+            <= DATEADD('day', 90, settings_state.review_start)
+            AS window_span_sensible,
 
         settings_state.unusable_thread_filters = 0 AS thread_filter_usable,
 
