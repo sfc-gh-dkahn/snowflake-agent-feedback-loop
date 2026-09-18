@@ -1,314 +1,71 @@
--- Run after fixtures.sql in the same disposable session and open transaction.
--- With Snow CLI, use the rendered fixture_pair.cli.sql instead.
--- Stop on error. The checks use synthetic data and call no AI.
--- On failure, inspect the preceding result in query history and roll back the session.
+-- Baseline only. Run once after saved_results.sql, before mutations.sql. NEVER production.
+USE DATABASE OUTPUT_DB;
+USE SCHEMA OUTPUT_DB.AGENT_FEEDBACK_TEST;
 
-USE DATABASE __OUTPUT_DATABASE__;
-USE SCHEMA __OUTPUT_SCHEMA__;
+INSERT INTO TEST_CHECKS
+SELECT 'same fixture session', 'true', (session_id = CURRENT_SESSION())::VARCHAR FROM TEST_CLOCK
+UNION ALL SELECT 'valid settings', 'true', settings_are_valid::VARCHAR FROM ANSWER_REVIEW_SETTINGS_STATUS
+UNION ALL SELECT 'valid eight areas', 'true', areas_are_valid::VARCHAR FROM CHANGE_AREAS_STATUS
+UNION ALL SELECT 'event count', '65', COUNT(*)::VARCHAR FROM AGENT_EVENTS
+UNION ALL SELECT 'root-backed turns, not orphan', '60', COUNT(*)::VARCHAR FROM CONVERSATION_TURNS
+UNION ALL SELECT 'agent-sensitive turn hashes', '60', COUNT(DISTINCT turn_hash)::VARCHAR FROM CONVERSATION_TURNS
+UNION ALL SELECT 'incomplete whitespace/redacted/missing', '4', COUNT(*)::VARCHAR FROM CONVERSATION_TURNS WHERE NOT is_complete
+UNION ALL SELECT 'unknown threads normalize to null', '6', COUNT(*)::VARCHAR FROM CONVERSATION_TURNS WHERE thread_id IS NULL
+UNION ALL SELECT 'all-history pair count', '44', COUNT(*)::VARCHAR FROM ANSWER_FOLLOWUP_PAIRS
+UNION ALL SELECT 'agent-sensitive pair hashes', '44', COUNT(DISTINCT pair_hash)::VARCHAR FROM ANSWER_FOLLOWUP_PAIRS
+UNION ALL SELECT 'incomplete middle blocks distant pairing', 'b3>b4', LISTAGG(response_trace_id || '>' || feedback_trace_id, ',') WITHIN GROUP (ORDER BY response_trace_id) FROM ANSWER_FOLLOWUP_PAIRS WHERE thread_id = 'broken'
+UNION ALL SELECT 'incomplete middle keeps position two', '2', turn_no::VARCHAR FROM CONVERSATION_TURNS WHERE trace_id = 'b2'
+UNION ALL SELECT 'last answer stays unjudged', '0', COUNT(*)::VARCHAR FROM ANSWER_FOLLOWUP_PAIRS WHERE response_trace_id = 't15'
+UNION ALL SELECT 'each agent owns shared trace', '3', COUNT(*)::VARCHAR FROM CONVERSATION_TURNS WHERE trace_id = 't01'
+UNION ALL SELECT 'internal spans kept without tool fields', '2', ARRAY_SIZE(tool_evidence)::VARCHAR FROM CONVERSATION_TURNS WHERE agent_name = 'SYNTH_A' AND trace_id = 't01'
+UNION ALL SELECT 'internal spans ordered by span at same time', 'chart,skill', tool_evidence[0]:event_hash::VARCHAR || ',' || tool_evidence[1]:event_hash::VARCHAR FROM CONVERSATION_TURNS WHERE agent_name = 'SYNTH_A' AND trace_id = 't01'
+UNION ALL SELECT 'latest root tie-break and earliest question', 'd-z|Earliest question.|Selected answer.', root_event_hash || '|' || user_question || '|' || agent_answer FROM CONVERSATION_TURNS WHERE trace_id = 'd1'
+UNION ALL SELECT 'six prior positions at long-thread end', '6', MIN(ARRAY_SIZE(evidence:prior_turns))::VARCHAR FROM ANSWER_FOLLOWUP_PAIRS WHERE feedback_trace_id = 't15'
+UNION ALL SELECT 'response closes prior context', 't14', MIN(evidence:prior_turns[5]:trace_id::VARCHAR) FROM ANSWER_FOLLOWUP_PAIRS WHERE feedback_trace_id = 't15'
+UNION ALL SELECT 'invalid specification stays visible', '1', COUNT(*)::VARCHAR FROM CURRENT_AGENT_SETTINGS WHERE NOT specification_is_valid AND config_hash IS NULL
+UNION ALL SELECT 'key order does not change config hash across agents', '1', COUNT(DISTINCT config_hash)::VARCHAR FROM CURRENT_AGENT_SETTINGS WHERE specification_is_valid
+UNION ALL SELECT 'bad root excluded from reviews', '0', COUNT(*)::VARCHAR FROM TEST_REVIEW_BASE WHERE agent_name = 'SYNTH_BAD'
+UNION ALL SELECT 'saved reviews including failures excluded on rerun', '0', COUNT(*)::VARCHAR FROM REVIEW_CANDIDATES
+UNION ALL SELECT 'repeat mock save does not duplicate reviews', '28', COUNT(*)::VARCHAR FROM ANSWER_REVIEWS
+UNION ALL SELECT 'invalid/error reviews excluded from observations', '22', COUNT(*)::VARCHAR FROM RECOMMENDATION_OBSERVATIONS
+UNION ALL SELECT 'full group count before cap', '16', COUNT(*)::VARCHAR FROM RECOMMENDATION_GROUPS
+UNION ALL SELECT 'response counts include both observations', '2', MIN(total_occurrences)::VARCHAR FROM RECOMMENDATION_GROUPS WHERE surface = 'instructions.response'
+UNION ALL SELECT 'good counterevidence counted per agent', '1', MIN(total_good_responses)::VARCHAR FROM RECOMMENDATION_GROUPS
+UNION ALL SELECT 'all current suggestions reused including failures', '4', COUNT(*)::VARCHAR FROM RECOMMENDATION_CANDIDATES WHERE has_saved_result
+UNION ALL SELECT 'saved suggestions never spend cap', '0', COUNT(*)::VARCHAR FROM RECOMMENDATION_CANDIDATES WHERE is_within_budget
+UNION ALL SELECT 'repeat save preserves exactly 42 suggestion results', '42', COUNT(*)::VARCHAR FROM RECOMMENDATIONS
+UNION ALL SELECT 'every suggestion needs human review', '0', COUNT(*)::VARCHAR FROM RECOMMENDATION_RESULTS WHERE NOT requires_human_review
+UNION ALL SELECT 'recommendation cases exercise all twelve fields', '24', COUNT(*)::VARCHAR FROM TEST_REC_CASES WHERE case_name LIKE 'missing_%' OR case_name LIKE 'type_%';
 
-EXECUTE IMMEDIATE $$
-DECLARE
-    fixture_count INTEGER;
-    fixture_transactions INTEGER;
-    fixture_transaction NUMBER;
-    checks RESULTSET;
-    checks_query_id VARCHAR;
-    failure_count INTEGER;
-    failure_details VARCHAR;
-    unsafe_session EXCEPTION (-20031, 'Run fixtures.sql first in this same session and transaction, using the same disposable rendered installation.');
-    assertion_failed EXCEPTION (-20032, 'Fixture assertions failed; the open transaction is rolled back at session scope. Inspect the preceding failure_count/failure_details SELECT in query history.');
-BEGIN
-    IF (CURRENT_TRANSACTION() IS NULL
-        OR CURRENT_DATABASE() <> '__OUTPUT_DATABASE__'
-        OR CURRENT_SCHEMA() <> '__OUTPUT_SCHEMA__') THEN
-        RAISE unsafe_session;
-    END IF;
-    SELECT COUNT(*), COUNT(DISTINCT fixture_transaction_id), MIN(fixture_transaction_id)
-    INTO :fixture_count, :fixture_transactions, :fixture_transaction
-    FROM AF_FIXTURE_EVENTS;
-    IF (fixture_count <> 120 OR fixture_transactions <> 1
-        OR NOT COALESCE(fixture_transaction = CURRENT_TRANSACTION(), FALSE)) THEN
-        RAISE unsafe_session;
-    END IF;
+INSERT INTO TEST_CHECKS
+SELECT 'review: ' || base.agent_name || '/' || cases.trace_id, cases.expected, COALESCE(findings.validation_status, 'MISSING')
+FROM TEST_REVIEW_BASE AS base JOIN TEST_REVIEW_CASES AS cases ON cases.trace_id = base.response_trace_id
+LEFT JOIN REVIEW_FINDINGS AS findings ON findings.review_id = base.review_id;
+INSERT INTO TEST_CHECKS
+SELECT 'recommendation: ' || cases.case_name, cases.expected, COALESCE(results.review_status, 'MISSING')
+FROM TEST_REC_CASES AS cases JOIN TEST_REC_INPUTS AS base ON base.surface = cases.surface
+LEFT JOIN RECOMMENDATION_RESULTS AS results ON results.recommendation_id = base.recommendation_id || ':' || cases.case_name;
+INSERT INTO TEST_CHECKS
+SELECT 'current queue: ' || base.agent_name || '/' || base.surface, outputs.expected, COALESCE(queue.queue_status, 'MISSING')
+FROM TEST_REC_BASE AS base JOIN TEST_REC_OUTPUTS AS outputs USING (recommendation_id)
+LEFT JOIN REVIEW_QUEUE AS queue ON queue.recommendation_id = base.recommendation_id;
+INSERT INTO TEST_CHECKS
+SELECT 'docs raw type: ' || case_name, expected, COALESCE(documentation_status, 'MISSING')
+FROM TEST_DOC_CASES LEFT JOIN DOCUMENTATION_STATUS ON retrieval_id = 'case:' || case_name;
+INSERT INTO TEST_CHECKS
+SELECT 'docs preserves exact text', ' Synthetic title |  Synthetic response guidance.  ', title || '|' || chunk
+FROM DOCUMENTATION_PASSAGES WHERE retrieval_id = 'instructions.response' AND passage_index = 0;
+INSERT INTO TEST_CHECKS
+SELECT 'docs gate: ' || agent_name || '/' || surface, column2, eligibility_status
+FROM VALUES ('instructions.response','eligible'), ('data','eligible'),
+    ('instructions.orchestration','bad_docs'), ('models.orchestration','bad_docs'),
+    ('tool_description','stale_docs'), ('semantic_view','missing_docs'),
+    ('verified_query','missing_docs'), ('skills','missing_docs')
+JOIN RECOMMENDATION_GROUPS ON surface = column1;
 
-    checks := (
-        WITH identities AS (
-            SELECT column1::VARCHAR AS agent_database, column2::VARCHAR AS agent_schema,
-                column3::VARCHAR AS agent_name,
-                column1 || '.' || column2 || '.' || column3 || ':' AS identity_prefix
-            FROM VALUES
-                ('AF_SYNTH_DB_A', 'AF_SYNTH_SCHEMA_A', 'AF_SYNTH_AGENT'),
-                ('AF_SYNTH_DB_B', 'AF_SYNTH_SCHEMA_A', 'AF_SYNTH_AGENT'),
-                ('AF_SYNTH_DB_A', 'AF_SYNTH_SCHEMA_B', 'AF_SYNTH_AGENT'),
-                ('AF_SYNTH_DB_A', 'AF_SYNTH_SCHEMA_A', 'AF_SYNTH_AGENT_OTHER')
-        ), expected_rows AS (
-            SELECT column1::VARCHAR AS trace_id, column2::VARCHAR AS root_key,
-                column3::VARCHAR AS thread_id, column4::INTEGER AS turn_no,
-                column5::BOOLEAN AS is_complete, column6::VARCHAR AS response_trace_id,
-                column7::VARCHAR AS user_message, column8::VARCHAR AS agent_response,
-                column9::INTEGER AS second_offset, column10::VARCHAR AS status_code
-            FROM VALUES
-                ('af_fixture_identity_01', 'identity_01', 'af_fixture_shared', 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 0, 'OK'),
-                ('af_fixture_identity_02', 'identity_02', 'af_fixture_shared', 2, TRUE, 'af_fixture_identity_01', 'Repeat the synthetic question.', 'Synthetic follow-up answer.', 0, 'OK'),
-                ('af_fixture_zero_01', 'zero_01', '0', 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 10, 'OK'),
-                ('af_fixture_zero_02', 'zero_02', '0', 2, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 11, 'OK'),
-                ('af_fixture_null_01', 'null_01', NULL, 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 20, 'OK'),
-                ('af_fixture_null_02', 'null_02', NULL, 2, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 21, 'OK'),
-                ('af_fixture_space_01', 'space_01', '   ', 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 22, 'OK'),
-                ('af_fixture_space_02', 'space_02', '   ', 2, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 23, 'OK'),
-                ('af_fixture_blank_01', 'blank_01', 'af_fixture_blank', 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 30, 'OK'),
-                ('af_fixture_blank_02', 'blank_02', 'af_fixture_blank', 2, FALSE, NULL, NULL, 'Synthetic answer.', 31, 'OK'),
-                ('af_fixture_blank_03', 'blank_03', 'af_fixture_blank', 3, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 32, 'OK'),
-                ('af_fixture_blank_04', 'blank_04', 'af_fixture_blank', 4, TRUE, 'af_fixture_blank_03', 'Synthetic question.', 'Synthetic answer.', 33, 'OK'),
-                ('af_fixture_redacted_01', 'redacted_01', 'af_fixture_redacted', 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 40, 'OK'),
-                ('af_fixture_redacted_02', 'redacted_02', 'af_fixture_redacted', 2, FALSE, NULL, 'Synthetic question.', '[redacted]', 41, 'OK'),
-                ('af_fixture_redacted_03', 'redacted_03', 'af_fixture_redacted', 3, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 42, 'OK'),
-                ('af_fixture_missing_01', 'missing_01', 'af_fixture_missing', 1, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 43, 'OK'),
-                ('af_fixture_missing_02', 'missing_02', 'af_fixture_missing', 2, FALSE, NULL, 'Synthetic question.', NULL, 44, 'ERROR'),
-                ('af_fixture_missing_03', 'missing_03', 'af_fixture_missing', 3, TRUE, NULL, 'Synthetic question.', 'Synthetic answer.', 45, 'OK'),
-                ('af_fixture_dedup_01', 'dedup_hash_z', 'af_fixture_dedup', 1, TRUE, NULL, 'First readable synthetic question.', 'Selected synthetic answer.', 50, 'OK'),
-                ('af_fixture_dedup_02', 'dedup_02', 'af_fixture_dedup', 2, TRUE, 'af_fixture_dedup_01', 'Synthetic question.', 'Synthetic answer.', 51, 'OK')
-        ), expected AS (
-            SELECT identities.*, expected_rows.* FROM identities CROSS JOIN expected_rows
-        ), actual AS (
-            SELECT turns.* FROM AF_TURNS AS turns
-            JOIN identities USING (agent_database, agent_schema, agent_name)
-        ), expected_pairs AS (
-            SELECT * FROM expected WHERE response_trace_id IS NOT NULL
-        ), actual_pairs AS (
-            SELECT pairs.* FROM AF_FEEDBACK_PAIRS AS pairs
-            JOIN identities USING (agent_database, agent_schema, agent_name)
-        ), expected_tool_rows AS (
-            SELECT column1::INTEGER AS tool_index, column2::VARCHAR AS event_key
-            FROM VALUES (0, 'sql_early'), (1, 'sql_tie_a'), (2, 'sql_tie_z'),
-                (3, 'sql_late'), (4, 'skill'), (5, 'chart')
-        ), expected_tools AS (
-            SELECT identities.*, expected_tool_rows.*,
-                fixture.span_id, fixture.span_name, fixture.tool_name, fixture.final_sql,
-                fixture.chart_spec, fixture.status_code, DATE_PART(epoch_nanosecond, fixture.event_ts) AS event_epoch_ns
-            FROM identities CROSS JOIN expected_tool_rows
-            JOIN AF_FIXTURE_EVENTS AS fixture
-              ON fixture.event_hash = identities.identity_prefix || expected_tool_rows.event_key
-        ), actual_tools AS (
-            SELECT actual.agent_database, actual.agent_schema, actual.agent_name,
-                actual.trace_id, tool.index AS tool_index, tool.value AS payload
-            FROM actual, LATERAL FLATTEN(INPUT => actual.tool_evidence) AS tool
-        ), expected_event_rows AS (
-            SELECT column1::VARCHAR AS trace_id, column2::INTEGER AS event_index,
-                column3::VARCHAR AS event_key
-            FROM VALUES
-                ('af_fixture_identity_01', 0, 'identity_01'),
-                ('af_fixture_identity_01', 1, 'sql_early'),
-                ('af_fixture_identity_01', 2, 'sql_tie_a'),
-                ('af_fixture_identity_01', 3, 'sql_tie_z'),
-                ('af_fixture_identity_01', 4, 'sql_late'),
-                ('af_fixture_identity_01', 5, 'skill'),
-                ('af_fixture_identity_01', 6, 'chart'),
-                ('af_fixture_dedup_01', 0, 'dedup_old'),
-                ('af_fixture_dedup_01', 1, 'dedup_span_a'),
-                ('af_fixture_dedup_01', 2, 'dedup_hash_a'),
-                ('af_fixture_dedup_01', 3, 'dedup_hash_z')
-        ), expected_events AS (
-            SELECT identities.*, expected_event_rows.*
-            FROM identities CROSS JOIN expected_event_rows
-            UNION ALL
-            SELECT agent_database, agent_schema, agent_name, identity_prefix,
-                trace_id, 0, root_key FROM expected
-            WHERE trace_id NOT IN ('af_fixture_identity_01', 'af_fixture_dedup_01')
-        ), actual_events AS (
-            SELECT actual.agent_database, actual.agent_schema, actual.agent_name,
-                actual.trace_id, event.index AS event_index, event.value::VARCHAR AS event_hash
-            FROM actual, LATERAL FLATTEN(INPUT => actual.event_hashes) AS event
-        ), verdicts AS (
-            SELECT column1::VARCHAR AS kind, PARSE_JSON(column2) AS payload
-            FROM VALUES
-                ('diagnosis', '{"assessment":"poor","issue_type":"agent_behavior","severity":"moderate","surface":"instructions.response","observation":"Synthetic format mismatch.","evidence_quote":"Synthetic answer.","suspected_cause":"unknown","preserve_behavior":"Preserve synthetic scope.","requires_review":true}'),
-                ('recommendation', '{"recommendation_warranted":true,"headline":"Review synthetic formatting.","reasoning":"Synthetic mock only.","suggested_change":"Investigate formatting.","change_mode":"investigate","displaced_text":"","preserve_behavior":"Preserve synthetic scope.","would_regress_good_behavior":false,"confidence":"low","data_gap_investigation":"","unknown_data_response_guidance":"","citations":[]}')
-        ), contract_cases AS (
-            SELECT kind, 'valid_base' AS case_name, payload, TRUE AS expected_valid FROM verdicts
-            UNION ALL
-            SELECT kind, 'missing_' || field.key, OBJECT_DELETE(payload::OBJECT, field.key), FALSE
-            FROM verdicts, LATERAL FLATTEN(INPUT => payload) AS field
-            UNION ALL
-            SELECT kind, 'null_' || field.key,
-                OBJECT_INSERT(payload::OBJECT, field.key, PARSE_JSON('null'), TRUE), FALSE
-            FROM verdicts, LATERAL FLATTEN(INPUT => payload) AS field
-            UNION ALL
-            SELECT kind, 'wrong_type_' || field.key,
-                OBJECT_INSERT(payload::OBJECT, field.key,
-                    IFF(IS_VARCHAR(field.value), TO_VARIANT(123), TO_VARIANT('false')), TRUE), FALSE
-            FROM verdicts, LATERAL FLATTEN(INPUT => payload) AS field
-            UNION ALL
-            SELECT kind, 'sql_null', NULL, FALSE FROM verdicts
-            UNION ALL
-            SELECT kind, 'json_null', PARSE_JSON('null'), FALSE FROM verdicts
-            UNION ALL
-            SELECT kind, 'empty_object', PARSE_JSON('{}'), FALSE FROM verdicts
-            UNION ALL
-            SELECT kind, 'array', PARSE_JSON('[]'), FALSE FROM verdicts
-            UNION ALL
-            SELECT kind, 'blank_observation', OBJECT_INSERT(payload::OBJECT, 'observation', '   ', TRUE), FALSE
-            FROM verdicts WHERE kind = 'diagnosis'
-            UNION ALL
-            SELECT kind, 'blank_quote', OBJECT_INSERT(payload::OBJECT, 'evidence_quote', '', TRUE), FALSE
-            FROM verdicts WHERE kind = 'diagnosis'
-            UNION ALL
-            SELECT kind, 'good_mock', OBJECT_INSERT(payload::OBJECT, 'assessment', 'good', TRUE), TRUE
-            FROM verdicts WHERE kind = 'diagnosis'
-            UNION ALL
-            SELECT kind, 'unclear_mock', OBJECT_INSERT(payload::OBJECT, 'assessment', 'unclear', TRUE), TRUE
-            FROM verdicts WHERE kind = 'diagnosis'
-            UNION ALL
-            SELECT kind, 'blank_headline', OBJECT_INSERT(payload::OBJECT, 'headline', '   ', TRUE), FALSE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'blank_warranted_change', OBJECT_INSERT(payload::OBJECT, 'suggested_change', '', TRUE), FALSE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'warranted_none', OBJECT_INSERT(payload::OBJECT, 'change_mode', 'none', TRUE), FALSE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'replace_without_text', OBJECT_INSERT(payload::OBJECT, 'change_mode', 'replace', TRUE), FALSE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'replace_with_text', OBJECT_INSERT(OBJECT_INSERT(payload::OBJECT,
-                'change_mode', 'replace', TRUE), 'displaced_text', 'Synthetic instruction.', TRUE), TRUE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'not_warranted', OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(payload::OBJECT,
-                'recommendation_warranted', FALSE, TRUE), 'change_mode', 'none', TRUE), 'suggested_change', '', TRUE), TRUE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            -- AF_RECOMMEND decides when both reported-gap fields are required.
-            SELECT kind, 'gap_two_part_populated', OBJECT_INSERT(OBJECT_INSERT(payload::OBJECT,
-                'data_gap_investigation', 'Check whether the reported scope is absent.', TRUE),
-                'unknown_data_response_guidance', 'Say the coverage is unknown and route to the approved contact path.', TRUE), TRUE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'gap_investigation_not_text', OBJECT_INSERT(payload::OBJECT,
-                'data_gap_investigation', TO_VARIANT(ARRAY_CONSTRUCT('investigate')), TRUE), FALSE
-            FROM verdicts WHERE kind = 'recommendation'
-            UNION ALL
-            SELECT kind, 'gap_guidance_not_text', OBJECT_INSERT(payload::OBJECT,
-                'unknown_data_response_guidance', TO_VARIANT(42), TRUE), FALSE
-            FROM verdicts WHERE kind = 'recommendation'
-        ), contract_results AS (
-            SELECT kind, case_name, expected_valid, AF_DIAGNOSIS_VALID(payload) AS actual_valid
-            FROM contract_cases WHERE kind = 'diagnosis'
-            UNION ALL
-            SELECT kind, case_name, expected_valid, AF_RECOMMENDATION_VALID(payload)
-            FROM contract_cases WHERE kind = 'recommendation'
-        ), text_cases AS (
-            SELECT column1::VARCHAR AS text_value, column2::BOOLEAN AS expected_present
-            FROM VALUES (NULL, FALSE), ('', FALSE), ('   ', FALSE), ('1', FALSE),
-                ('null', FALSE), ('[redacted]', FALSE), ('<redacted>', FALSE),
-                (' ReDaCtEd ', FALSE), ('Synthetic content.', TRUE)
-        ), failures AS (
-            SELECT 'turn_contract' AS check_name,
-                COALESCE(expected.agent_database, actual.agent_database) || '.'
-                || COALESCE(expected.agent_schema, actual.agent_schema) || '.'
-                || COALESCE(expected.agent_name, actual.agent_name) || ':'
-                || COALESCE(expected.trace_id, actual.trace_id) AS detail
-            FROM expected FULL OUTER JOIN actual
-                USING (agent_database, agent_schema, agent_name, trace_id)
-            WHERE expected.trace_id IS NULL OR actual.trace_id IS NULL
-                OR actual.root_event_hash IS DISTINCT FROM expected.identity_prefix || expected.root_key
-                OR actual.thread_id IS DISTINCT FROM expected.thread_id
-                OR actual.turn_no IS DISTINCT FROM expected.turn_no
-                OR actual.is_complete IS DISTINCT FROM expected.is_complete
-                OR actual.user_message IS DISTINCT FROM expected.user_message
-                OR actual.agent_response IS DISTINCT FROM expected.agent_response
-                OR actual.status_code IS DISTINCT FROM expected.status_code
-                OR actual.message_id IS DISTINCT FROM expected.trace_id || '_message'
-                OR actual.event_ts IS DISTINCT FROM DATEADD('second', expected.second_offset, '2001-01-01T00:00:00+00:00'::TIMESTAMP_LTZ)
-                OR NOT COALESCE(REGEXP_LIKE(actual.turn_hash, '[0-9a-fA-F]{64}'), FALSE)
-            UNION ALL
-            SELECT 'turn_cardinality', 'Expected 80 turns and 80 distinct identity-sensitive hashes.'
-            WHERE (SELECT COUNT(*) FROM actual) <> 80
-                OR (SELECT COUNT(DISTINCT turn_hash) FROM actual) <> 80
-            UNION ALL
-            SELECT 'pair_contract', COALESCE(expected_pairs.trace_id, actual_pairs.trace_id)
-            FROM expected_pairs FULL OUTER JOIN actual_pairs
-                USING (agent_database, agent_schema, agent_name, trace_id)
-            WHERE expected_pairs.trace_id IS NULL OR actual_pairs.trace_id IS NULL
-                OR actual_pairs.response_trace_id IS DISTINCT FROM expected_pairs.response_trace_id
-            UNION ALL
-            SELECT 'pair_cardinality', 'Expected exactly 12 adjacent complete pairs.'
-            WHERE (SELECT COUNT(*) FROM actual_pairs) <> 12
-            UNION ALL
-            SELECT 'response_hash', pairs.trace_id FROM actual_pairs AS pairs
-            LEFT JOIN actual AS response
-              ON response.agent_database = pairs.agent_database AND response.agent_schema = pairs.agent_schema
-             AND response.agent_name = pairs.agent_name AND response.trace_id = pairs.response_trace_id
-            WHERE pairs.response_turn_hash IS DISTINCT FROM response.turn_hash
-            UNION ALL
-            SELECT 'tool_contract', COALESCE(expected_tools.event_key, actual_tools.trace_id)
-            FROM expected_tools FULL OUTER JOIN actual_tools
-              ON expected_tools.agent_database = actual_tools.agent_database
-             AND expected_tools.agent_schema = actual_tools.agent_schema
-             AND expected_tools.agent_name = actual_tools.agent_name
-             AND actual_tools.trace_id = 'af_fixture_identity_01'
-             AND expected_tools.tool_index = actual_tools.tool_index
-            WHERE expected_tools.event_key IS NULL OR actual_tools.trace_id IS NULL
-                OR actual_tools.payload:event_hash::VARCHAR IS DISTINCT FROM expected_tools.identity_prefix || expected_tools.event_key
-                OR actual_tools.payload:span_id::VARCHAR IS DISTINCT FROM expected_tools.span_id
-                OR actual_tools.payload:span_name::VARCHAR IS DISTINCT FROM expected_tools.span_name
-                OR actual_tools.payload:tool_name::VARCHAR IS DISTINCT FROM expected_tools.tool_name
-                OR actual_tools.payload:final_sql::VARCHAR IS DISTINCT FROM expected_tools.final_sql
-                OR actual_tools.payload:chart_spec::VARCHAR IS DISTINCT FROM expected_tools.chart_spec
-                OR actual_tools.payload:status_code::VARCHAR IS DISTINCT FROM expected_tools.status_code
-                OR actual_tools.payload:event_epoch_ns::NUMBER IS DISTINCT FROM expected_tools.event_epoch_ns
-                OR ARRAY_SIZE(OBJECT_KEYS(actual_tools.payload)) IS DISTINCT FROM 8
-            UNION ALL
-            SELECT 'event_order', COALESCE(expected_events.event_key, actual_events.event_hash)
-            FROM expected_events FULL OUTER JOIN actual_events
-                USING (agent_database, agent_schema, agent_name, trace_id, event_index)
-            WHERE expected_events.event_key IS NULL OR actual_events.event_hash IS NULL
-                OR actual_events.event_hash IS DISTINCT FROM expected_events.identity_prefix || expected_events.event_key
-            UNION ALL
-            SELECT kind || '_contract', case_name FROM contract_results
-            WHERE actual_valid IS DISTINCT FROM expected_valid
-            UNION ALL
-            SELECT 'text_present', COALESCE(text_value, 'SQL NULL') FROM text_cases
-            WHERE AF_TEXT_PRESENT(text_value) IS DISTINCT FROM expected_present
-            UNION ALL
-            SELECT 'fixture_rows', 'Expected exactly 120 uncommitted synthetic events.'
-            WHERE (SELECT COUNT(*) FROM AF_EVENTS) <> 120
-        )
-        SELECT check_name, detail FROM failures ORDER BY check_name, detail
-    );
-    checks_query_id := SQLID;
-    SELECT COUNT(*), LISTAGG(check_name || ': ' || detail, '\n')
-        WITHIN GROUP (ORDER BY check_name, detail)
-    INTO :failure_count, :failure_details
-    FROM TABLE(RESULT_SCAN(:checks_query_id));
-    IF (failure_count <> 0) THEN
-        SELECT :failure_count AS failure_count, :failure_details AS failure_details;
-        RAISE assertion_failed;
-    END IF;
-    RETURN OBJECT_CONSTRUCT('status', 'CHECKS_PASS', 'failure_count', failure_count,
-        'events_tested', 120, 'turns_tested', 80, 'pairs_tested', 12,
-        'rolled_back', FALSE, 'inference_performed', FALSE);
-END;
-$$;
-
--- The session opened the transaction, so rollback stays at session scope.
-ROLLBACK;
-
-EXECUTE IMMEDIATE $$
-DECLARE
-    remaining_events INTEGER;
-    cleanup_failed EXCEPTION (-20033, 'Rollback did not clear AF_EVENTS; inspect concurrent writers or transaction handling.');
-BEGIN
-    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
-        RAISE cleanup_failed;
-    END IF;
-    SELECT COUNT(*) INTO :remaining_events FROM AF_EVENTS;
-    IF (remaining_events <> 0) THEN
-        RAISE cleanup_failed;
-    END IF;
-    RETURN OBJECT_CONSTRUCT('status', 'PASS', 'failure_count', 0,
-        'events_tested', 120, 'turns_tested', 80, 'pairs_tested', 12,
-        'rolled_back', TRUE, 'inference_performed', FALSE);
-END;
-$$;
+SELECT test_name, COALESCE(expected = actual, FALSE) AS passed, expected, actual
+FROM TEST_CHECKS ORDER BY test_name;
+SELECT COUNT(*) AS tests, COALESCE(COUNT_IF(actual IS DISTINCT FROM expected), 0) AS failures,
+       IFF(COUNT(*) > 0 AND COALESCE(COUNT_IF(actual IS DISTINCT FROM expected), 0) = 0, 'PASS', 'FAIL') AS status
+FROM TEST_CHECKS;
+-- Stop on any failure. PASS covers saved-data view behavior only, not live APIs.
