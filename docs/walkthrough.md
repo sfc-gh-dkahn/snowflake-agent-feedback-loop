@@ -27,13 +27,17 @@ SHOW CORTEX BASE MODELS;
 
 Set `AF_CONFIG.docs_service` to the accessible three-part service name from the [Snowflake Documentation CKE](https://app.snowflake.com/marketplace/listing/GZSTZ67BY9OQ4). The service must return `SOURCE_URL`, `DOCUMENT_TITLE`, and `CHUNK`.
 
-Run preflight:
+Run the three checks in `sql/01_preflight.sql`, in order, and read each result. It writes nothing and calls no AI.
 
-```sql
-CALL OUTPUT_DB.AGENT_FEEDBACK.AF_PREFLIGHT();
-```
+There is no `ok = true` to require any more. You read counts instead:
 
-Require `ok = true`. Preflight reads recent observability events and the agent specification. It calls no AI.
+- **Settings status.** `settings_status` must say `ready`. Anything else names the failing check beside it; fix it in `REVIEW_SETTINGS` and read it again. The window is checked as exact elapsed time, so 90 days plus an hour fails; a `thread_filter` that is blank or `0` is a configuration error, not "all threads".
+- **`DESCRIBE AGENT`.** One row back, with the instructions and model you expect in `agent_spec`. An error here is an access or naming problem.
+- **Evidence status.** `complete_traces_in_scope` must be above zero, or there is nothing to review. The query reports the all-threads counts next to the filtered one, plus traces missing a root, missing usable text, or carrying no usable thread ID, so a zero is explained rather than unexplained.
+
+Read the shape of that third result, not only the numbers. Usable settings always return exactly one row, even when every count is zero. That row is a real answer: the window held no complete turns. **No row at all** says something else, that the settings guard rejected the row and nothing was read. Section 1 names the check that failed.
+
+The window and the thread filter come from `REVIEW_SETTINGS`, so preflight reviews the same scope the later scripts do. Reading the agent and its events proves neither that your remaining grants are complete nor that the judging model and documentation service are reachable; each later script proves its own access by running.
 
 ## 3. Run One Thread
 
