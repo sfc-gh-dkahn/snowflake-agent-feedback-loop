@@ -75,16 +75,16 @@ batches. Submit the complete `DESCRIBE AGENT ->> INSERT ... ;` chain in 02 as on
 statement. Use AUTOCOMMIT with no open transaction; earlier writes survive failures.
 Do not run concurrent copies or change settings, capture or docs during a batch.
 
-| File | Reads | Writes / result | Paid AI or search? |
-| --- | --- | --- | --- |
-| [00_setup.sql](sql/00_setup.sql) | Editable seed literals | Two reference tables: `REVIEW_SETTINGS`, `CHANGE_AREAS` | No |
-| [01_preflight.sql](sql/01_preflight.sql) | Settings, source agent and events | No writes; readiness and complete-turn counts | No |
-| [02_capture_context.sql](sql/02_capture_context.sql) | Settings, source agent and events | `AGENT_SETTINGS_HISTORY`, new `AGENT_EVENTS` rows | No |
-| [03_prepare_feedback.sql](sql/03_prepare_feedback.sql) | All saved events | Creates/replaces `CONVERSATION_TURNS`, `ANSWER_FOLLOWUP_PAIRS` views | No |
-| [04_diagnose.sql](sql/04_diagnose.sql) | Pairs, captured settings, review settings, saved results | Views, temporary batches, immutable `ANSWER_REVIEW_INPUTS` and `ANSWER_REVIEWS` | Yes: capped new reviews |
-| [05_retrieve_documentation.sql](sql/05_retrieve_documentation.sql) | Literal service/queries; settings and areas for inspection | `DOCUMENTATION_RETRIEVALS` and three read views | Yes: eight explicit searches per full run |
-| [06_recommendations.sql](sql/06_recommendations.sql) | Saved reviews/docs, current pairs/settings, change areas | Views, temporary batches, immutable `RECOMMENDATION_INPUTS` and `RECOMMENDATIONS` | Yes: capped new suggestions |
-| [07_inspect_results.sql](sql/07_inspect_results.sql) | Saved tables and views | No writes; coverage, current queue, history and errors | No |
+| File | Reads | Writes / result |
+| --- | --- | --- |
+| [00_setup.sql](sql/00_setup.sql) | Editable seed literals | Two reference tables: `REVIEW_SETTINGS`, `CHANGE_AREAS` |
+| [01_preflight.sql](sql/01_preflight.sql) | Settings, source agent and events | No writes; readiness and complete-turn counts |
+| [02_capture_context.sql](sql/02_capture_context.sql) | Settings, source agent and events | `AGENT_SETTINGS_HISTORY`, new `AGENT_EVENTS` rows |
+| [03_prepare_feedback.sql](sql/03_prepare_feedback.sql) | All saved events | Creates/replaces `CONVERSATION_TURNS`, `ANSWER_FOLLOWUP_PAIRS` views |
+| [04_diagnose.sql](sql/04_diagnose.sql) | Pairs, captured settings, review settings, saved results | Views, temporary batches, immutable `ANSWER_REVIEW_INPUTS` and `ANSWER_REVIEWS` |
+| [05_retrieve_documentation.sql](sql/05_retrieve_documentation.sql) | Literal service/queries; settings and areas for inspection | `DOCUMENTATION_RETRIEVALS` and three read views |
+| [06_recommendations.sql](sql/06_recommendations.sql) | Saved reviews/docs, current pairs/settings, change areas | Views, temporary batches, immutable `RECOMMENDATION_INPUTS` and `RECOMMENDATIONS` |
+| [07_inspect_results.sql](sql/07_inspect_results.sql) | Saved tables and views | No writes; coverage, current queue, history and errors |
 
 Pause at the exact-input preview before each paid insert in 04 and 06. A full 05
 run pays for all eight searches, even with fresh saved docs or no eligible findings.
