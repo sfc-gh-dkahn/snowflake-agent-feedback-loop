@@ -256,15 +256,15 @@ WITH settings_state AS (
         MIN(max_new_recommendations) AS max_new_recommendations,
         MIN(min_occurrences) AS min_occurrences,
         MIN(docs_max_age_hours) AS docs_max_age_hours,
-        MIN(LENGTH(TRIM(prompt_revision))) AS prompt_revision_length,
+        MIN(LENGTH(TRIM(prompt_revision, ' \t\r\n'))) AS prompt_revision_length,
         -- Count the rows whose thread filter is unusable: present, but blank
         -- once trimmed, or the string '0'. NULL means "all threads" and is
         -- fine, so NULL rows are not counted here.
         COUNT(
             CASE
                 WHEN thread_filter IS NOT NULL
-                     AND (LENGTH(TRIM(thread_filter)) = 0
-                          OR TRIM(thread_filter) = '0')
+                     AND (LENGTH(TRIM(thread_filter, ' \t\r\n')) = 0
+                          OR TRIM(thread_filter, ' \t\r\n') = '0')
                 THEN 1
             END
         ) AS unusable_thread_filters
@@ -294,8 +294,8 @@ area_state AS (
                 THEN area_key
             END
         ) AS expected_area_keys_present,
-        MIN(LENGTH(TRIM(area_description))) AS shortest_area_description,
-        MIN(LENGTH(TRIM(documentation_query))) AS shortest_documentation_query
+        MIN(LENGTH(TRIM(area_description, ' \t\r\n'))) AS shortest_area_description,
+        MIN(LENGTH(TRIM(documentation_query, ' \t\r\n'))) AS shortest_documentation_query
     FROM CHANGE_AREAS
 ),
 

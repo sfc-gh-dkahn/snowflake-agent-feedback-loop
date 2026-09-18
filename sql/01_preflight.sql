@@ -52,15 +52,15 @@ WITH settings_state AS (
         MIN(max_new_recommendations) AS max_new_recommendations,
         MIN(min_occurrences) AS min_occurrences,
         MIN(docs_max_age_hours) AS docs_max_age_hours,
-        MIN(LENGTH(TRIM(prompt_revision))) AS prompt_revision_length,
+        MIN(LENGTH(TRIM(prompt_revision, ' \t\r\n'))) AS prompt_revision_length,
         -- NULL thread_filter means "all threads" and is fine. Present but
         -- blank once trimmed, or the string '0', is a configuration error:
         -- treating it as "all" would silently widen the run.
         COUNT(
             CASE
                 WHEN thread_filter IS NOT NULL
-                     AND (LENGTH(TRIM(thread_filter)) = 0
-                          OR TRIM(thread_filter) = '0')
+                     AND (LENGTH(TRIM(thread_filter, ' \t\r\n')) = 0
+                          OR TRIM(thread_filter, ' \t\r\n') = '0')
                 THEN 1
             END
         ) AS unusable_thread_filters
@@ -191,12 +191,12 @@ valid_settings AS (
       AND review_end <= DATEADD('minute', -15, SYSDATE())
       AND review_end <= DATEADD('day', 90, review_start)
       AND (thread_filter IS NULL
-           OR (LENGTH(TRIM(thread_filter)) > 0 AND TRIM(thread_filter) <> '0'))
+           OR (LENGTH(TRIM(thread_filter, ' \t\r\n')) > 0 AND TRIM(thread_filter, ' \t\r\n') <> '0'))
       AND max_new_reviews BETWEEN 1 AND 100
       AND max_new_recommendations BETWEEN 1 AND 20
       AND min_occurrences BETWEEN 1 AND 1000
       AND docs_max_age_hours BETWEEN 1 AND 720
-      AND LENGTH(TRIM(prompt_revision)) > 0
+      AND LENGTH(TRIM(prompt_revision, ' \t\r\n')) > 0
 ),
 
 recorded_spans AS (
@@ -222,16 +222,16 @@ recorded_spans AS (
         events.trace:span_id::VARCHAR AS span_id,
         events.record_attributes:"ai.observability.span_type"::VARCHAR AS span_type,
         NULLIF(
-            NULLIF(TRIM(events.record_attributes:"snow.ai.observability.agent.thread_id"::VARCHAR), ''),
+            NULLIF(TRIM(events.record_attributes:"snow.ai.observability.agent.thread_id"::VARCHAR, ' \t\r\n'), ''),
             '0'
         ) AS thread_id,
         COALESCE(
-            LOWER(TRIM(events.record_attributes:"snow.ai.observability.agent.planning.query"::VARCHAR))
+            LOWER(TRIM(events.record_attributes:"snow.ai.observability.agent.planning.query"::VARCHAR, ' \t\r\n'))
                 NOT IN ('', '1', 'null', '[redacted]', '<redacted>', 'redacted'),
             FALSE
         ) AS question_is_usable,
         COALESCE(
-            LOWER(TRIM(events.record_attributes:"snow.ai.observability.agent.response"::VARCHAR))
+            LOWER(TRIM(events.record_attributes:"snow.ai.observability.agent.response"::VARCHAR, ' \t\r\n'))
                 NOT IN ('', '1', 'null', '[redacted]', '<redacted>', 'redacted'),
             FALSE
         ) AS answer_is_usable
@@ -242,7 +242,7 @@ recorded_spans AS (
         'CORTEX AGENT'
     )) AS events
     WHERE events.record_type = 'SPAN'
-      AND NULLIF(TRIM(events.trace:trace_id::VARCHAR), '') IS NOT NULL
+      AND NULLIF(TRIM(events.trace:trace_id::VARCHAR, ' \t\r\n'), '') IS NOT NULL
 ),
 
 spans_in_window AS (
@@ -314,7 +314,7 @@ turns AS (
 -- itself, so the placeholder row the LEFT JOIN supplies counts as nothing.
 SELECT
     -- What the filter is, so the numbers are read in the right scope.
-    COALESCE('thread ' || TRIM(valid_settings.thread_filter), 'all threads')
+    COALESCE('thread ' || TRIM(valid_settings.thread_filter, ' \t\r\n'), 'all threads')
         AS thread_scope,
     valid_settings.review_start,
     valid_settings.review_end,
@@ -344,7 +344,7 @@ SELECT
         COUNT_IF(
             turns.has_root AND turns.has_question AND turns.has_answer
             AND (valid_settings.thread_filter IS NULL
-                 OR turns.root_thread_id = TRIM(valid_settings.thread_filter))
+                 OR turns.root_thread_id = TRIM(valid_settings.thread_filter, ' \t\r\n'))
         ),
         0
     ) AS complete_traces_in_scope,
@@ -353,7 +353,7 @@ SELECT
         WHEN COUNT_IF(
                  turns.has_root AND turns.has_question AND turns.has_answer
                  AND (valid_settings.thread_filter IS NULL
-                      OR turns.root_thread_id = TRIM(valid_settings.thread_filter))
+                      OR turns.root_thread_id = TRIM(valid_settings.thread_filter, ' \t\r\n'))
              ) > 0
         THEN 'complete turns found: there is something to review'
         ELSE 'no complete turns in scope: widen the window, clear the thread filter, or review the counts'
