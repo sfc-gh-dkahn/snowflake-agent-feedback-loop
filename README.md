@@ -103,7 +103,7 @@ CALL OUTPUT_DB.AGENT_FEEDBACK.AF_PREFLIGHT();
 
 Require `ok = true`. Preflight checks configuration, the agent specification, and readable recent events. It does not call AI or test every task-owner grant.
 
-`AF_CONFIG` defaults to a 14-day lookback, 20 new diagnoses, 5 new recommendation calls, 2 poor responses per surface, a 168-hour docs cache, and prompt revision `2`.
+`sql/00_setup.sql` seeds `REVIEW_SETTINGS` with an explicit UTC review window, no thread filter, 20 new reviews, 5 new recommendation calls, 2 poor answers per change area, a 168-hour documentation age limit, and prompt revision `2`. Edit the window before the first run. It also seeds `CHANGE_AREAS` with the eight parts of an agent a suggestion may address. Reruns leave both tables alone rather than resetting your edits.
 
 ## Run and Review
 
