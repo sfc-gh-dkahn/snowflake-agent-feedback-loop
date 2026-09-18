@@ -1,148 +1,122 @@
 # Snowflake Agent Feedback Loop
 
-This project reviews conversations from one existing Cortex Agent. It stores evidence and drafts suggestions for human review. It does not change the agent.
+Find answers worth a closer look, then trace each suggested improvement back to
+the conversation and official documentation that support it.
 
-The install creates tables, views, procedures, and a suspended task graph in an existing empty schema. It does not create an agent, database, role, warehouse, or schedule.
+These eight SQL files review one existing Cortex Agent. You can follow each read,
+inspect each saved table, and decide whether to pay for the next step. The output
+is a set of findings and proposed changes for a person to review, not agent edits.
 
-This is a personal project, not an official Snowflake project. It has no license.
+**Source-only, statically reviewed SQL.** The SQL tests are authored, not compiled
+or run in Snowflake. This is not production-certified or an official Snowflake
+project. This personal project has no license.
 
-## Cortex Code Path
-
-Use Cortex Code to keep the first run small and reviewable:
-
-1. Clone the repository and open it in Cortex Code.
-2. Discover the agent, role, warehouse, model, empty output schema, and Snowflake Documentation service you will use.
-3. Render configured SQL with `tools/render_install.py`.
-4. Review `local/render/PLAN.txt` and the rendered files.
-5. Install the ordered SQL files with the commands in the plan.
-6. Run `AF_PREFLIGHT` and require `ok = true`.
-7. Run one short window for one conversation thread.
-8. Review `AF_RUNS`, `AF_FINDINGS`, and `AF_REVIEW_QUEUE` before widening the scope.
-
-## How It Works
+## Follow the Data
 
 ```text
-AF_START -> AF_CAPTURE -> AF_PREPARE -> AF_DIAGNOSE -> AF_RECOMMEND -> AF_FINISH
-AF_FINALIZE marks unfinished graph runs as failed.
+00: REVIEW_SETTINGS + CHANGE_AREAS -> scope, limits and review categories
+01: settings + source agent/events -> readiness and evidence counts
+
+02: DESCRIBE AGENT -> AGENT_SETTINGS_HISTORY -> CURRENT_AGENT_SETTINGS (04)
+02: GET_AI_OBSERVABILITY_EVENTS -> AGENT_EVENTS
+03: AGENT_EVENTS -> CONVERSATION_TURNS -> ANSWER_FOLLOWUP_PAIRS
+04: pairs + current settings + REVIEW_SETTINGS -> REVIEW_CANDIDATES
+    -> ANSWER_REVIEW_INPUTS -> paid AI -> ANSWER_REVIEWS -> REVIEW_FINDINGS
+
+05: documentation search service -> eight paid searches
+    -> DOCUMENTATION_RETRIEVALS -> DOCUMENTATION_PASSAGES / DOCUMENTATION_LATEST
+06: findings + current pairs/settings + CHANGE_AREAS + saved documentation
+    -> RECOMMENDATION_OBSERVATIONS -> RECOMMENDATION_GROUPS
+    -> RECOMMENDATION_CANDIDATES -> RECOMMENDATION_INPUTS
+    -> paid AI -> RECOMMENDATIONS -> RECOMMENDATION_RESULTS -> REVIEW_QUEUE
+07: saved evidence + views + results -> coverage, backlog and error counts
 ```
 
-The pipeline:
+## Before You Start
 
-1. Captures a bounded set of agent observability events and the current agent specification.
-2. Pairs each complete answer with the next complete user turn in the same thread.
-3. Uses AI to classify the follow-up as good, poor, or unclear evidence.
-4. Groups poor findings and retrieves official Snowflake documentation.
-5. Drafts a change or investigation for a person to review.
+- [ ] Choose one existing agent and an existing, empty output schema in a database you may use. Do not point these scripts at a populated older installation.
+- [ ] Select an approved role and existing warehouse. The role needs warehouse/database/schema usage, permission to create tables and views in the output schema, and access to read/write those objects and replace its views.
+- [ ] Confirm the role can describe the agent and read its observability events. See [agent monitoring](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-monitor).
+- [ ] Confirm account, region, role and model access for [AI_COMPLETE](https://docs.snowflake.com/en/sql-reference/functions/ai_complete), including structured output. The sample model name is not an availability promise.
+- [ ] For recommendations, have an accessible official-documentation search service exposing `SOURCE_URL`, `DOCUMENT_TITLE`, `CHUNK`. See [SEARCH_PREVIEW](https://docs.snowflake.com/en/sql-reference/functions/search_preview-snowflake-cortex) and the [Snowflake Documentation listing](https://app.snowflake.com/marketplace/listing/GZSTZ67BY9OQ4). The scripts do not provision it.
 
-A follow-up is a clue about the prior answer, not a rating. The current agent specification may differ from the version that produced an older answer. Findings and suggestions can be wrong.
+Saved prompts, answers, SQL, settings and errors can contain sensitive text. Restrict
+the output schema and decide how long to keep it. Views do not sanitize it, and
+the scripts do not delete old evidence.
 
-## Requirements
+## Customize Four Literals
 
-Choose:
+Edit the SQL directly before running. Use ignored `local/` for account-specific
+copies; do not commit real names, conversation IDs or results.
 
-- One existing Cortex Agent.
-- An approved role and warehouse.
-- An existing database with an empty output schema.
-- A permitted model that supports structured output.
-- An accessible Cortex Search service from the [Snowflake Documentation CKE](https://app.snowflake.com/marketplace/listing/GZSTZ67BY9OQ4).
-
-The role must be able to read the agent specification and observability events, use the warehouse, run AI inference, search the documentation service, and own the installed objects and tasks. Tasks run as their owner role.
-
-Raw events may contain prompts, responses, SQL, chart specifications, and sensitive data. Restrict the output schema and set a retention policy. This project does not delete old data.
-
-Version 1 accepts simple uppercase, unquoted object names. Agent and documentation service names must use three parts. Keep configured files and query results under ignored `local/`, `results/`, or `logs/`.
-
-## Render Private SQL
-
-Run the renderer from the repository root:
-
-```bash
-python3 -B tools/render_install.py render \
-  --output-database OUTPUT_DB \
-  --output-schema AGENT_FEEDBACK \
-  --agent AGENT_DB.AGENT_SCHEMA.AGENT_NAME \
-  --warehouse AGENT_WH \
-  --role AGENT_REVIEWER \
-  --judge-model your-model \
-  --docs-service DOCS_DB.DOCS_SCHEMA.DOCS_SERVICE
-```
-
-Add `--connection NAME` if you do not want the Snow CLI default connection. Output goes to `local/render` unless you set `--out` to another ignored path.
-
-The renderer validates names, replaces every placeholder, and writes `PLAN.txt` with exact `snow sql` commands. It also writes:
-
-- `local/render/sql/06_tasks.cli.sql`: task DDL wrapped for the Snow CLI statement splitter.
-- `local/render/tests/fixture_pair.cli.sql`: fixtures and assertions in one CLI session.
-
-Use these generated files with `snow sql`. Use the plain rendered `sql/06_tasks.sql` in Snowsight.
-
-The renderer runs no SQL.
-
-## Install
-
-Create the empty schema yourself, or render the DDL for review:
-
-```bash
-python3 -B tools/render_install.py create-schema --approve-ddl \
-  --output-database OUTPUT_DB \
-  --output-schema AGENT_FEEDBACK \
-  --agent AGENT_DB.AGENT_SCHEMA.AGENT_NAME \
-  --warehouse AGENT_WH \
-  --role AGENT_REVIEWER \
-  --judge-model your-model \
-  --docs-service DOCS_DB.DOCS_SCHEMA.DOCS_SERVICE
-```
-
-Then follow `local/render/PLAN.txt`. The CLI path runs the first six install files and then `06_tasks.cli.sql`. All seven tasks start suspended. The root has no schedule and no automatic retries.
-
-Run preflight before inference:
-
-```sql
-CALL OUTPUT_DB.AGENT_FEEDBACK.AF_PREFLIGHT();
-```
-
-Require `ok = true`. Preflight checks configuration, the agent specification, and readable recent events. It does not call AI or test every task-owner grant.
-
-`sql/00_setup.sql` seeds `REVIEW_SETTINGS` with an explicit UTC review window, no thread filter, 20 new reviews, 5 new recommendation calls, 2 poor answers per change area, a 168-hour documentation age limit, and prompt revision `2`. Edit the window before the first run. It also seeds `CHANGE_AREAS` with the eight parts of an agent a suggestion may address. Reruns leave both tables alone rather than resetting your edits.
-
-## Run and Review
-
-Start with one thread and a short time window. Review the evidence scope and likely AI cost first. Row limits do not cap tokens or total credits.
-
-The [walkthrough](docs/walkthrough.md) shows task and manual runs. Keep task runs and manual runs serialized.
-
-Review these views and tables:
-
-| Object | Use |
+| Choice | Where to change it |
 | --- | --- |
-| `AF_FINDINGS` | Diagnoses and validation state |
-| `AF_REVIEW_QUEUE` | Suggested changes, citations, and errors |
-| `AF_RUNS` | Stage, status, coverage counts, and failures |
+| Output location | Replace `OUTPUT_DB` and `AGENT_FEEDBACK` consistently in the core files and optional email file. |
+| Agent FQN | Replace `AGENT_DB.AGENT_SCHEMA.AGENT_NAME` in 01/02, plus every separate `'AGENT_DB'`, `'AGENT_SCHEMA'`, `'AGENT_NAME'` literal there, including saved event labels. |
+| Review model | Replace every `claude-sonnet-4-6` literal in 04 and 06 together: model calls, identity fields and matching guards. Do not change only the call. |
+| Documentation service | Replace every `DOCS_DB.DOCS_SCHEMA.DOCS_SERVICE` literal across 05 and 06, including searches, saved labels, joins and inspections. |
 
-`COMPLETE` means the selected work finished. It does not mean every conversation was reviewed or the agent is accurate. `PARTIAL` means work was delayed, sampled, missing docs, or had invalid or failed AI output.
+Dates, thread filter, call limits, occurrence threshold, docs age and prompt revision
+live **only in the single `REVIEW_SETTINGS` row**. For a fresh setup, edit its seed
+in 00. After setup, `UPDATE` the row keyed `settings_id = 1`; never add a second row.
+Rerunning setup preserves edits. Do not repeat dates or operating limits elsewhere.
+The fixed search limit and prompt sample sizes are separate source policies.
 
-The project never applies suggestions. Views can repeat sensitive source text even when they omit raw columns. Review content before sharing it.
+Start with a short UTC window and one known thread. **Capture still saves all
+threads for that agent in the window; the thread filter narrows reviews only.**
+The seed defaults are 20 new reviews, 5 new recommendations, 2 occurrences,
+168-hour docs age and revision `2`; lower the call caps for the first review.
 
-## Limits
+## Run in Order
 
-- Only adjacent complete turns in a nonempty thread can form a feedback pair.
-- An answer with no later complete turn remains unjudged.
-- New work can outpace the configured limits and age out of the lookback window.
-- Recommendation prompts sample evidence even when the full group count is larger.
-- Documentation cache age measures retrieval time, not publication time.
-- AI calls and email do not have exactly-once delivery guarantees.
-- A changed `prompt_revision`, model, configuration, evidence set, or docs set can create new AI work and cost.
+Select each statement, run it, and read its result before continuing. Stop on any
+error. Keep all of 04 in one SQL session, and likewise all of 06: both use temporary
+batches. Submit the complete `DESCRIBE AGENT ->> INSERT ... ;` chain in 02 as one
+statement. Use AUTOCOMMIT with no open transaction; earlier writes survive failures.
+Do not run concurrent copies or change settings, capture or docs during a batch.
 
-Install `optional/email.sql` only if you need email. It uses an existing notification integration and does not create a schedule.
+| File | Reads | Writes / result | Paid AI or search? |
+| --- | --- | --- | --- |
+| [00_setup.sql](sql/00_setup.sql) | Editable seed literals | Two reference tables: `REVIEW_SETTINGS`, `CHANGE_AREAS` | No |
+| [01_preflight.sql](sql/01_preflight.sql) | Settings, source agent and events | No writes; readiness and complete-turn counts | No |
+| [02_capture_context.sql](sql/02_capture_context.sql) | Settings, source agent and events | `AGENT_SETTINGS_HISTORY`, new `AGENT_EVENTS` rows | No |
+| [03_prepare_feedback.sql](sql/03_prepare_feedback.sql) | All saved events | Creates/replaces `CONVERSATION_TURNS`, `ANSWER_FOLLOWUP_PAIRS` views | No |
+| [04_diagnose.sql](sql/04_diagnose.sql) | Pairs, captured settings, review settings, saved results | Views, temporary batches, immutable `ANSWER_REVIEW_INPUTS` and `ANSWER_REVIEWS` | Yes: capped new reviews |
+| [05_retrieve_documentation.sql](sql/05_retrieve_documentation.sql) | Literal service/queries; settings and areas for inspection | `DOCUMENTATION_RETRIEVALS` and three read views | Yes: eight explicit searches per full run |
+| [06_recommendations.sql](sql/06_recommendations.sql) | Saved reviews/docs, current pairs/settings, change areas | Views, temporary batches, immutable `RECOMMENDATION_INPUTS` and `RECOMMENDATIONS` | Yes: capped new suggestions |
+| [07_inspect_results.sql](sql/07_inspect_results.sql) | Saved tables and views | No writes; coverage, current queue, history and errors | No |
 
-## Tests
+Pause at the exact-input preview before each paid insert in 04 and 06. A full 05
+run pays for all eight searches, even with fresh saved docs or no eligible findings.
+Its searches are not capped by `REVIEW_SETTINGS` and have no automatic cache.
+Ordinary queries, including repeated view reads, still incur warehouse compute;
+read views themselves never call AI or search. Row caps do not cap tokens or credits.
 
-Run the offline tests:
+For later reviews: update settings, preflight, capture, use the saved-history views
+(recreate 03 only if definitions changed), run 04, manually refresh docs as needed,
+then run 06 and inspect with 07. A changed prompt revision requires 04 before 06.
 
-```bash
-python3 -B -m unittest discover -s tests -p 'test_*.py' -v
-```
+## Read the Results
 
-These tests check source contracts and rendering. They do not compile SQL in Snowflake. The rendered `fixture_pair.cli.sql` tests deterministic SQL behavior in one approved disposable installation.
+`REVIEW_FINDINGS` separates `valid`, `invalid_output` and `ai_error`.
+`REVIEW_QUEUE` shows current suggestions and what blocks them. Use 07 to distinguish
+unjudged turns, work over the cap, missing docs, saved errors and historical results.
+There is no run ledger or automatic completion status; empty does not mean healthy.
 
-See [docs/dbt-adaptation.md](docs/dbt-adaptation.md) for a design-only dbt mapping.
+Only adjacent complete turns in the same usable thread form a pair. A final answer
+or an answer followed by an incomplete turn stays unjudged. Follow-ups are clues,
+not ratings. Captured settings describe capture time, not the version that answered.
+Reported data gaps call for investigation, never a claim that data or access is absent.
+
+Saved errors and invalid outputs are retained, not retried automatically. Changed
+material inputs or an intentional new `prompt_revision` can create new paid work.
+Unchanged content can reuse results, but statement failures, cancellation and
+concurrent writers can repeat charges. There is **no exactly-once guarantee**.
+
+No script changes an agent. [Optional email](optional/email.sql) only previews as
+shipped; sending requires a separate, reviewed literal call. Nothing sends automatically.
+
+Read the [step-by-step walkthrough](docs/walkthrough.md), the
+[isolated SQL test instructions](tests/README.md), or the
+[design-only dbt adaptation](docs/dbt-adaptation.md). This SQL path does not promise
+the operational behavior of the former procedure/task implementation.

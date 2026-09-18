@@ -1,147 +1,285 @@
 # Walkthrough
 
-This guide runs one small review against an existing Cortex Agent. It does not create or change the agent.
+Follow one conversation from captured events to a finding, then decide whether a
+documentation-backed suggestion is worth generating. This guide uses a synthetic
+sales assistant and an invented thread label, `example-thread`. Neither names a
+real account or promises that your agent has the same data or behavior.
 
-The Cortex Code path is: clone, discover values, render, review, install, preflight, run one thread, then review the result.
+The SQL is source-only and statically reviewed. The isolated tests are authored,
+not compiled or run in Snowflake. This guide describes intended behavior, not a
+verified production installation.
 
-## 1. Render
+## 1. Set the Scope
 
-Follow the renderer command in `README.md`. It writes configured files under `local/render` and prints the install commands in `local/render/PLAN.txt`.
+Complete the [README dependency checklist and literal edits](../README.md).
+Use one existing agent per empty output schema, an approved role and an existing
+warehouse. No script creates the database, schema, role, warehouse or agent.
 
-For Snow CLI, use the generated files:
+In `sql/00_setup.sql`, edit the `REVIEW_SETTINGS` seed for a short UTC window that
+contains a known conversation. Replace the synthetic thread label with a real one
+only in your private copy. Start with `max_new_reviews = 1` and
+`max_new_recommendations = 1`. Keep `min_occurrences = 2`: the first pass may give
+you a finding without enough evidence for a suggestion. That is useful, not failure.
 
-- `sql/06_tasks.cli.sql` for task DDL.
-- `tests/fixture_pair.cli.sql` for the SQL test pair.
+Run 00 statement by statement. It creates and seeds two reference tables:
+`REVIEW_SETTINGS` and the eight-row `CHANGE_AREAS`. Read the stored values and
+require a ready configuration status. The seed writes only into an empty table.
+After setup, change the existing settings row with `UPDATE`, keyed on
+`settings_id = 1`; do not edit the seed expecting it to reset saved settings.
 
-The plain `sql/06_tasks.sql` is for Snowsight. Snow CLI can split the semicolons inside a task's Snowflake Scripting body. The generated CLI file wraps each task in `EXECUTE IMMEDIATE` so the body stays whole.
+The dates, thread filter, call caps, threshold, docs age and revision belong only
+in that row. The four literal choices in the README remain at their call sites.
+Keep the model literals aligned across 04/06 and the service literals across 05/06.
 
-## 2. Install and Check
+Window start is inclusive and end is exclusive. End must be at least 15 minutes
+before current UTC time; the span must not exceed 90 elapsed days. These are project
+guards, not a guarantee of event availability. `NULL` thread filter means all
+threads; blank, whitespace-only and `0` are invalid. All call caps must be positive.
 
-Use the approved role and warehouse. Install files `00` through `05`, then install the generated `06_tasks.cli.sql`. The tasks remain suspended.
+## 2. Check Before Capturing
 
-Confirm the model is allowed and supports structured output:
+Run the three checks in `sql/01_preflight.sql` in order:
 
-```sql
-SHOW CORTEX BASE MODELS;
+1. Read `settings_status` and each named check. Fix failing settings before continuing.
+2. Read `DESCRIBE AGENT`. Expect one row with the intended `agent_spec`; stop on a naming or access error.
+3. Read the evidence counts. Compare `complete_traces` across all threads with `complete_traces_in_scope` for your selected thread.
+
+A thread is a conversation, a trace is one turn, and a span records part of that
+turn. A complete turn needs a root, a usable question and a usable answer. Counts
+also expose missing roots, missing text and unusable thread IDs. Missing or redacted
+text does not prove the agent failed to answer.
+
+Valid settings produce one count row even with zero traffic. No row means the
+settings guard rejected the scope. Complete turns do not yet prove that any can
+form adjacent pairs. Preflight does not check output-write privileges, model access
+or documentation-service readiness.
+
+## 3. Capture the Evidence
+
+Run `sql/02_capture_context.sql` in order. Submit its entire
+`DESCRIBE AGENT ->> INSERT ... ;` chain as **one statement**, not two selections.
+The pipe passes the description directly into `AGENT_SETTINGS_HISTORY`.
+
+Each capture appends a settings snapshot. The event `MERGE` adds distinct selected
+spans to `AGENT_EVENTS`, leaving saved rows unchanged. An overlapping capture can
+collect late arrivals without adding identical events again. Read the snapshot,
+saved counts and event sample after the writes.
+
+**Capture saves all threads in the selected window.** `thread_filter` controls
+preflight's in-scope count and later reviews, not event collection. Tool spans may
+have no thread ID; capture keeps them so their trace can supply the missing link.
+Capture counts cover all saved history, not just new rows from this execution.
+
+The source event timestamp is already UTC `TIMESTAMP_NTZ`. Capture saves the same
+instant as `TIMESTAMP_LTZ` using epoch nanoseconds; 03 converts that saved column
+back to UTC NTZ for comparisons. The settings dates use UTC by convention, since
+NTZ itself has no zone. Capture time is separate from the time an event occurred.
+
+An agent snapshot describes settings **when captured**, not when older answers
+were produced. The latest saved snapshot is not a live read of the agent. Even an
+invalid review window does not undo an already-saved snapshot. Events can arrive
+late, be unavailable, or straddle a window edge. Choose a window wide enough for
+context, and inspect the actual saved turns rather than assuming full coverage.
+
+## 4. Rebuild the Conversation
+
+Run `sql/03_prepare_feedback.sql`. It creates two views over all saved events,
+not new copies of those events. `CONVERSATION_TURNS` picks one root per trace,
+the earliest usable question, and ordered tool evidence. It numbers every
+root-backed turn **before** testing completeness.
+
+Here is a synthetic complete three-turn thread:
+
+```text
+Turn 1: User asks for September sales. Agent gives an annual total.
+Turn 2: User says "September only, please." Agent gives September sales.
+Turn 3: User says "That matches my September report." Agent acknowledges.
+
+Turn 1 answer + turn 2 follow-up -> one reviewable pair
+Turn 2 answer + turn 3 follow-up -> one reviewable pair
+Turn 3 answer                  -> unjudged: no next turn
 ```
 
-Set `AF_CONFIG.docs_service` to the accessible three-part service name from the [Snowflake Documentation CKE](https://app.snowflake.com/marketplace/listing/GZSTZ67BY9OQ4). The service must return `SOURCE_URL`, `DOCUMENT_TITLE`, and `CHUNK`.
+The correction may support a poor assessment; the confirmation may support a good
+one. Neither is a measured grade. A new topic or a simple thank-you may be unclear.
+If turn 2 lacks a usable question or answer, neither pair qualifies. The SQL never
+skips turn 2 to pair turns 1 and 3. Unknown, blank and `0` threads never pair.
 
-Run the three checks in `sql/01_preflight.sql`, in order, and read each result. It writes nothing and calls no AI.
+`ANSWER_FOLLOWUP_PAIRS.evidence` holds the follow-up plus complete turns from the
+six positions ending at the answer being reviewed. It is not six extra turns, and
+it does not reach farther back to fill an incomplete position. For the second pair
+above, prior context includes turns 1 and 2; turn 3 is the follow-up.
 
-There is no `ok = true` to require any more. You read counts instead:
+Inspect pairs and unpaired answers before paying. Three complete turns can yield
+two pairs, not three judged answers. 04 selects pairs by **follow-up time** in the
+settings window. Earlier saved context can fall outside that window.
 
-- **Settings status.** `settings_status` must say `ready`. Anything else names the failing check beside it; fix it in `REVIEW_SETTINGS` and read it again. The window is checked as exact elapsed time, so 90 days plus an hour fails; a `thread_filter` that is blank or `0` is a configuration error, not "all threads".
-- **`DESCRIBE AGENT`.** One row back, with the instructions and model you expect in `agent_spec`. An error here is an access or naming problem.
-- **Evidence status.** `complete_traces_in_scope` must be above zero, or there is nothing to review. The query reports the all-threads counts next to the filtered one, plus traces missing a root, missing usable text, or carrying no usable thread ID, so a zero is explained rather than unexplained.
+## 5. Review Answers (Paid)
 
-Read the shape of that third result, not only the numbers. Usable settings always return exactly one row, even when every count is zero. That row is a real answer: the window held no complete turns. **No row at all** says something else, that the settings guard rejected the row and nothing was read. Section 1 names the check that failed.
+Run `sql/04_diagnose.sql` sequentially in one SQL session. Do not change settings,
+capture more events, or start another writer while it runs.
 
-The window and the thread filter come from `REVIEW_SETTINGS`, so preflight reviews the same scope the later scripts do. Reading the agent and its events proves neither that your remaining grants are complete nor that the judging model and documentation service are reachable; each later script proves its own access by running.
+1. Inspect `CURRENT_AGENT_SETTINGS` and `ANSWER_REVIEW_SETTINGS_STATUS`. Missing or nonobject specifications cannot feed a review.
+2. Read `REVIEW_CANDIDATES`: eligible unsaved reviews, those within the cap and those deferred. Saved results, including errors, are excluded before ranking.
+3. Freeze `ANSWER_REVIEW_BATCH` and save its exact prompts in `ANSWER_REVIEW_INPUTS`.
+4. Freeze `ANSWER_REVIEW_INFERENCE_BATCH` from saved prompts. Read its preview immediately before the paid insert. Stop here if scope or cost is not approved.
+5. Run the paid insert into `ANSWER_REVIEWS`, then create/read `REVIEW_FINDINGS` and the inspection results.
 
-## 3. Run One Thread
+The paid insert uses `AI_COMPLETE` and saves its raw `value`/`error` envelope.
+Validation then checks saved data without another model call. `valid` means the
+required fields and exact evidence quote passed checks, not that the conclusion
+is true. Read `observation` separately from `suspected_cause`. `invalid_output` and
+`ai_error` remain visible and saved.
 
-Choose a known thread and explicit timestamps with `Z` or an offset. The end must be at least 15 minutes old. The window must fit `lookback_days` and cannot exceed 90 days.
+With a cap of one, the example may leave a second review deferred. Another
+deliberate run of 04 can take the next unsaved identity if it remains eligible.
+The displayed backlog is a current read, not a persisted execution record.
 
-Review the evidence scope, model, and likely AI cost before running.
+Row caps do not cap tokens or credits. Full selected conversation text remains in
+prompts; oversized prompts can error. Character counts are size clues, not token
+counts or cost estimates. Re-reading any view uses warehouse compute, not new AI.
 
-Resume child tasks and the finalizer. Leave the root suspended:
+## 6. Retrieve Documentation (Paid)
 
-```sql
-USE ROLE AGENT_REVIEWER;
-USE WAREHOUSE AGENT_WH;
-USE DATABASE OUTPUT_DB;
-USE SCHEMA AGENT_FEEDBACK;
+Run `sql/05_retrieve_documentation.sql` after 04. On first setup it creates
+`DOCUMENTATION_RETRIEVALS` and three views, then runs **eight explicit paid search
+inserts**, one per change area. All eight run on a full execution, whether findings
+exist or saved passages are fresh. `REVIEW_SETTINGS` does not limit these calls.
 
-ALTER TASK AF_START SUSPEND;
-ALTER TASK AF_CAPTURE RESUME;
-ALTER TASK AF_PREPARE RESUME;
-ALTER TASK AF_DIAGNOSE RESUME;
-ALTER TASK AF_RECOMMEND RESUME;
-ALTER TASK AF_FINISH RESUME;
-ALTER TASK AF_FINALIZE RESUME;
+The queries are generic feature questions, never conversation text. The service
+must expose `SOURCE_URL`, `DOCUMENT_TITLE`, `CHUNK`. Accepted passages require the
+official `https://docs.snowflake.com/` prefix and usable text. Rejected entries stay
+in the raw response. Accepted text keeps its original whitespace for quote checks.
 
-EXECUTE TASK AF_START USING CONFIG = $${
-  "window_start": "2026-09-01T10:00:00Z",
-  "window_end": "2026-09-01T11:00:00Z",
-  "thread_filter": "YOUR_THREAD_ID"
-}$$;
-```
+Inspect `DOCUMENTATION_STATUS`, query alignment, readiness and the saved passages.
+Match the exact area, service and query. Changing `CHANGE_AREAS.documentation_query`
+does not change a search call: each insert has both a saved query literal and a
+literal API query that must agree with the reference row.
 
-This requests one run. It does not add a schedule. Task `CONFIG` accepts only `window_start`, `window_end`, and `thread_filter`.
+For a later refresh, manually run the one area's complete insert and inspections,
+or deliberately run all eight. There is **no automatic cache or refresh**.
+`docs_max_age_hours` gates recommendation readiness; it measures retrieval age,
+not publication date or service-index freshness. Future capture times are invalid.
 
-Wait for the graph and finalizer before another run or configuration change.
+`DOCUMENTATION_LATEST` chooses the latest exact search before checking its status.
+A newer empty, rejected, malformed or error response masks older ready passages;
+it does not fall back. A mixed response can be ready with rejected entries, but
+only its accepted passages can support a suggestion. Search may truncate large
+responses, so saved passages are not proof of full-document coverage.
 
-## Manual Run
+If a search statement fails, **stop**. It cannot save that failure as a row, even
+though prior inserts remain. Do not continue with old docs after a failed refresh.
+Resolve the cause and decide whether to pay for a retry; status views cannot expose
+an unsaved statement failure.
 
-`AF_RUN` calls each stage in one session and does not need resumed child tasks:
+## 7. Draft Suggestions (Paid)
 
-```sql
-CALL OUTPUT_DB.AGENT_FEEDBACK.AF_RUN(
-    '2026-09-01T10:00:00Z'::TIMESTAMP_LTZ,
-    '2026-09-01T11:00:00Z'::TIMESTAMP_LTZ,
-    'YOUR_THREAD_ID');
-```
+Run `sql/06_recommendations.sql` in order in one session, with no concurrent
+writers, settings changes, capture or documentation refresh. It reads saved reviews
+that match current evidence, captured settings, window, model and prompt revision.
+A newer saved failed review masks an older success under the same selection scope.
 
-Keep `AF_START` suspended and confirm no graph run is active. Do not run the manual and task paths at the same time.
+`RECOMMENDATION_GROUPS` groups observations by agent and change area. It counts all
+distinct reviewed answers before applying `min_occurrences`. Poor agent behavior
+qualifies on nondata areas; reported data gaps qualify on `data` even if assessed
+good or unclear. There is no severe-finding or repeated-thread threshold bypass.
+Grouping does not prove that the answers share a cause.
 
-Using `NULL` timestamps selects the configured lookback ending 15 minutes ago. A `NULL` thread filter reviews all eligible threads in the window. Use those broader settings only after the one-thread run works.
+A group with five qualifying answers reports five occurrences, but the prompt
+contains at most **three examples**. It also contains at most **two good
+counterexamples** from the same agent's current review scope, across any area.
+Full and sampled member identities remain saved. Severity affects sample order,
+not threshold eligibility. The three-turn example alone need not qualify a group.
 
-## 4. Read the Result
+Read the group gates, then `RECOMMENDATION_CANDIDATES` for reused results, new work
+within the separate cap, and deferred groups. Settings, eight valid areas, enough
+evidence and fresh ready exact-query docs must all pass. Save the frozen batch into
+`RECOMMENDATION_INPUTS`. Preview `RECOMMENDATION_INFERENCE_BATCH` immediately before
+the paid insert into `RECOMMENDATIONS`. Freshness is checked again before inference.
 
-```sql
-SELECT * FROM AF_RUNS ORDER BY started_at DESC LIMIT 10;
-SELECT * FROM AF_FINDINGS ORDER BY feedback_ts DESC LIMIT 100;
-SELECT * FROM AF_REVIEW_QUEUE ORDER BY created_at DESC LIMIT 100;
-```
+`RECOMMENDATION_RESULTS` validates the saved output. Warranted advice needs exact
+quotes at the supplied URLs in the same saved passages. Replacements must quote
+existing text from the same instruction surface. Only response/orchestration
+instructions permit append or replace proposals; other areas permit investigation.
+Matching text does not prove the citation supports the advice.
 
-Check `AF_RUNS.diagnostics`:
+A warranted reported data gap needs two distinct actions: how a person checks the
+reported scope, and how the agent responds when data is unknown. It cannot establish
+that a table, row or permission is missing, or invent a contact. Text checks can
+reject harmless wording and miss unsafe advice. Every proposal needs human review.
 
-- `prepare.candidate_pairs`: all eligible pairs in the window.
-- `prepare.cached_pairs`: pairs mapped to stored diagnoses.
-- `prepare.new_pairs`: unseen pairs selected for this run.
-- `prepare.pairs_over_limit`: unseen pairs delayed by `max_diagnoses`.
-- `diagnose`: attempted, invalid, and failed diagnosis calls.
-- `recommend`: selected groups, docs state, AI calls, reuse, and errors.
-- `finish`: pending, invalid, sampled, missing-docs, and omitted counts.
+## 8. Inspect, Then Decide
 
-`COMPLETE` means selected processing finished. `PARTIAL` means some work was delayed, sampled, missing docs, invalid, or failed.
+Run `sql/07_inspect_results.sql`. It reads existing objects only. Read settings
+first, then full-history coverage, selected-window backlog, raw results and errors,
+saved inputs without results, the current queue, history and duplicate IDs.
 
-## What the Stages Mean
+| Queue state | What to check |
+| --- | --- |
+| `invalid_settings` | Settings and change-area status; a sentinel row is not an evidence group. |
+| `insufficient_evidence` | Distinct answer count against the threshold. |
+| `missing_docs`, `bad_docs`, `stale_docs` | Exact service/query match, latest response and retrieval age. |
+| `deferred`, `awaiting_inference` | Current cap and whether selected inputs have a saved result. |
+| `ai_error`, `invalid_output` | Saved error or validation reason; not an automatic retry request. |
+| `suppressed` | No warranted recommendation or risk of regressing good behavior. |
+| `needs_human_review` | Read evidence, counterexamples, citations and scope before deciding. |
 
-Preparation pairs an answer with the next complete user turn in the same thread. It does not skip an incomplete turn to join distant answers. The last answer in a thread has no later feedback proxy.
+Full-history counts are not selected-window counts. Invalid settings give NULL
+selected-window counts rather than a false zero-work result. Unpaired complete
+turns remain unjudged; incomplete turns are separate. A saved input without a result
+may no longer be eligible. Zero suggestions can mean no qualifying evidence, no
+usable pairs, blocked settings/docs, deferred work or failed processing.
 
-A diagnosis is a review hypothesis. Validation checks its JSON shape and confirms that `evidence_quote` appears in supplied text. It does not prove the assessment.
+`REVIEW_QUEUE` joins the current candidate identity, not the latest result for a
+surface. Old results stay in history after evidence/config/docs changes or docs
+expiry. There is no run ledger, automatic COMPLETE status or automatic agent change.
 
-Recommendations need poor evidence that meets `min_occurrences`, one severe finding, or repeated evidence in one thread. They also need usable official docs. The model receives bounded samples of poor, good, and repeated evidence.
+## Repeat or Recover
 
-Technical citations must use a supplied Snowflake docs URL and an exact quote from its chunk. A person must still check that the quote supports the suggestion.
+Run statements sequentially with AUTOCOMMIT and no open transaction. Stop on any
+error; earlier successful writes remain. The scripts do not provide a multi-step
+rollback or an execution lock. Inspect saved inputs/results before restarting the
+affected file in order, and rebuild temporary batches rather than jumping into a
+paid insert from another session.
 
-Reported data gaps can produce investigation steps only. They cannot confirm that a table, record, dataset, or permission is missing.
+Saved errors and invalid results are final for their identity. To retry unchanged
+evidence deliberately, update `prompt_revision` and run 04 before 06. This can
+re-review the selected scope, not just one failed row, and incurs new charges.
+Do not delete or overwrite saved results to force a retry.
 
-## Retry
+Changed evidence, configuration content, model or prompt/schema policies can create
+new review identities. Recommendation identities also include full/sample review
+membership and docs service/query/content. Unchanged recaptures and fresh retrievals
+of identical docs content can reuse results. Capture IDs/times and budget-only
+changes do not themselves create new identities; thresholds and docs age affect
+eligibility. Moving the window can change group membership and thus suggestion IDs.
 
-After a failure, inspect `AF_RUNS.stage`, `error_message`, and restricted task or query history. Fix the cause and start a new run.
+No exactly-once guarantee exists. A statement can spend money then fail to persist;
+cancellation, retry or concurrent execution can repeat charges. Documentation
+refreshes always cost again when explicitly run.
 
-Stored AI errors and invalid outputs are reused for the same identity. To retry unchanged evidence, change `prompt_revision` between runs. That creates new AI work and can add cost.
-
-Do not edit a `RUNNING` row until you have confirmed that no work is active. The run guard is not an atomic cross-session lock.
-
-## Optional Schedule
-
-Add a schedule only after the bounded run, task-owner checks, and coverage review succeed. Resume the root last:
-
-```sql
-ALTER TASK AF_START SUSPEND;
-ALTER TASK AF_START SET CONFIG = '{}';
-ALTER TASK AF_START SET SCHEDULE = 'USING CRON 0 9 * * MON UTC';
-ALTER TASK AF_START RESUME;
-```
-
-This example runs Mondays at 09:00 UTC. Change it to the approved time.
+For the next window, update the one settings row, preflight, capture, read the
+existing 03 views (recreate only after definition changes), run 04, refresh needed
+docs manually, run 06, then inspect 07. Current reads cannot reconstruct a run log.
 
 ## Optional Email
 
-`optional/email.sql` creates a delivery table and `AF_SEND_EMAIL`. It needs an existing email integration and one recipient. It creates no integration or schedule.
+After 00-07, [optional/email.sql](../optional/email.sql) previews queue counts and
+at most 20 headlines. Running it as shipped sends nothing and writes nothing.
+Headlines can still disclose sensitive information; formatting is not redaction.
 
-Preview `AF_REVIEW_QUEUE` before sending. Calls must be serialized. An `UNCERTAIN_DO_NOT_RESEND` result means delivery may have happened; check before any retry.
+For an approved send, review the actual subject/body and recipient. Use the
+commented literal `SYSTEM$SEND_EMAIL` example in a separate worksheet with an
+existing email integration and validated recipient. Keep the shipped call commented
+out. Follow its literal escaping rules; never paste model output as executable SQL.
+See [official email prerequisites](https://docs.snowflake.com/en/user-guide/notifications/email-stored-procedures).
+
+There is no delivery ledger, deduplication or automatic resend. A successful call
+does not prove inbox delivery; reconcile uncertainty before sending again.
+
+## Test Separately
+
+Follow [tests/README.md](../tests/README.md) only in an approved, empty disposable
+test schema. It installs selected **view statements only**, not whole paid scripts,
+and supplies synthetic saved results. Those tests have not been run. Even a future
+PASS would not prove live access, APIs, capture, paid batches or concurrency safety.
