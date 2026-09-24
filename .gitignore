@@ -1,0 +1,10 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.cortex/
+.snowflake/
+.plan-runner/
+local/
+results/
+logs/
